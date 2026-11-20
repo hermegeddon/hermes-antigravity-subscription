@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import ipaddress
 import json
@@ -12,11 +13,14 @@ import ntpath
 import os
 import pathlib
 import re
+import shutil
 import socket
 import tempfile
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
@@ -302,6 +306,25 @@ _MEDIA_OPENER = urllib.request.build_opener(_SafeMediaRedirectHandler)
 # use instead of handing agy a dead reference.
 _REMOTE_MEDIA_MEMO: dict[str, tuple[str, str]] = {}
 _REMOTE_MEDIA_MEMO_LIMIT = 512
+_REMOTE_MEDIA_MEMO_LOCK = threading.Lock()
+
+
+class _SessionMediaSink(set):
+    """Per-client materialized media tracker with an isolated cache subdirectory."""
+
+    def __init__(self, session_id: str | None = None) -> None:
+        super().__init__()
+        self.session_id = session_id or uuid.uuid4().hex
+
+    @property
+    def cache_dir(self) -> str:
+        return os.path.join(_media_cache_dir(), f"session_{self.session_id}")
+
+
+def _cache_dir_for_sink(media_sink: Optional[set]) -> str:
+    if isinstance(media_sink, _SessionMediaSink):
+        return media_sink.cache_dir
+    return _media_cache_dir()
 
 
 def _is_plugin_owned_media_path(path: str) -> bool:
@@ -330,6 +353,115 @@ def _register_materialized(
     if fpath and media_sink is not None and _is_plugin_owned_media_path(fpath):
         media_sink.add(fpath)
     return fpath, mtype
+
+
+def cleanup_session_media(
+    paths: set[str], cache_dir: str | None = None
+) -> None:
+    """Delete plugin-owned *paths* for a closed session and prune stale memo entries.
+
+    Foreign paths outside the plugin media cache dir are skipped (review
+    5887913331, point 1). Empty session subdirectories inside the media cache
+    dir are removed so per-session directories do not accumulate.
+    """
+    deleted_paths: set[str] = set()
+    for path in paths:
+        if not _is_plugin_owned_media_path(path):
+            logger.debug("Skipping non-plugin-owned media path on close: %s", path)
+            continue
+        real = os.path.normcase(os.path.realpath(path))
+        try:
+            os.remove(path)
+            deleted_paths.add(real)
+        except FileNotFoundError:
+            deleted_paths.add(real)
+        except OSError:
+            pass
+
+    if deleted_paths:
+        with _REMOTE_MEDIA_MEMO_LOCK:
+            for url, (cached_path, _) in list(_REMOTE_MEDIA_MEMO.items()):
+                if os.path.normcase(os.path.realpath(cached_path)) in deleted_paths:
+                    _REMOTE_MEDIA_MEMO.pop(url, None)
+
+    if cache_dir and _is_plugin_owned_media_path(cache_dir):
+        real_dir = os.path.normcase(os.path.realpath(cache_dir))
+        cache_root = os.path.normcase(os.path.realpath(_media_cache_dir()))
+        if real_dir != cache_root:
+            with contextlib.suppress(OSError):
+                os.rmdir(cache_dir)
+
+
+def _write_bytes_atomically(cache_dir: str, fpath: str, raw: bytes) -> None:
+    os.makedirs(cache_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=cache_dir, suffix=".part")
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(raw)
+        os.replace(tmp_path, fpath)
+    finally:
+        if os.path.exists(tmp_path):
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
+
+
+def _clone_cached_file(src_path: str, target_dir: str, dest_path: str) -> bool:
+    """Hardlink or atomically copy *src_path* to *dest_path* in *target_dir*."""
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except OSError:
+        return False
+    try:
+        os.link(src_path, dest_path)
+        return True
+    except FileNotFoundError:
+        return False
+    except FileExistsError:
+        return os.path.isfile(dest_path)
+    except OSError:
+        pass
+
+    tmp_path: str | None = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=target_dir, suffix=".part")
+        with os.fdopen(fd, "wb") as dst, open(src_path, "rb") as src:
+            shutil.copyfileobj(src, dst)
+        os.replace(tmp_path, dest_path)
+        return True
+    except OSError:
+        return False
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
+
+
+def _resolve_memoized_remote_media(
+    url: str, target_dir: str
+) -> Optional[tuple[str, str]]:
+    """Return a usable (path, kind) in *target_dir* for a memoized *url*, or None.
+
+    Caller must hold ``_REMOTE_MEDIA_MEMO_LOCK``.
+    """
+    memo = _REMOTE_MEDIA_MEMO.get(url)
+    if memo is None:
+        return None
+    memo_path, memo_kind = memo
+    if not os.path.isfile(memo_path):
+        _REMOTE_MEDIA_MEMO.pop(url, None)
+        return None
+    dest_path = os.path.join(target_dir, os.path.basename(memo_path))
+    if (
+        os.path.normcase(os.path.realpath(memo_path))
+        == os.path.normcase(os.path.realpath(dest_path))
+        or os.path.isfile(dest_path)
+    ):
+        return dest_path, memo_kind
+    if _clone_cached_file(memo_path, target_dir, dest_path):
+        return dest_path, memo_kind
+    if not os.path.isfile(memo_path):
+        _REMOTE_MEDIA_MEMO.pop(url, None)
+    return None
 
 
 def _media_ext_for_mime(mime: str) -> Optional[str]:
@@ -377,7 +509,9 @@ def _resolve_file_uri_path(url: str) -> str | None:
     return local
 
 
-def _stream_download_to_cache(resp: Any, ext: str) -> Optional[tuple[str, str]]:
+def _stream_download_to_cache(
+    resp: Any, ext: str, cache_dir: str | None = None
+) -> Optional[tuple[str, str]]:
     """Stream a media response into the cache dir under a hard size cap.
 
     Writes to a temp file and renames only after the whole body passed the
@@ -385,7 +519,7 @@ def _stream_download_to_cache(resp: Any, ext: str) -> Optional[tuple[str, str]]:
     to read. Returns (path, kind) or None when the cap is exceeded.
     """
     digest = hashlib.sha256()
-    cache_dir = _media_cache_dir()
+    cache_dir = cache_dir or _media_cache_dir()
     os.makedirs(cache_dir, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=cache_dir, suffix=".part")
     total = 0
@@ -454,13 +588,11 @@ def _materialize_media(
                 logger.debug("Refused data URL mime with no media extension: %s", mime)
                 return "", ""
             h = hashlib.sha256(raw).hexdigest()[:16]
-            cache_dir = _media_cache_dir()
+            cache_dir = _cache_dir_for_sink(media_sink)
             fpath = os.path.join(cache_dir, f"{h}{ext}")
             if not os.path.exists(fpath):
                 try:
-                    os.makedirs(cache_dir, exist_ok=True)
-                    with open(fpath, "wb") as f:
-                        f.write(raw)
+                    _write_bytes_atomically(cache_dir, fpath, raw)
                 except OSError as exc:
                     logger.debug("Failed to write materialized data URL media: %s", exc)
                     return "", ""
@@ -497,11 +629,11 @@ def _materialize_media(
         except ValueError as exc:
             logger.debug("Refused remote media URL %s: %s", url, exc)
             return "", ""
-        memo = _REMOTE_MEDIA_MEMO.get(url)
-        if memo is not None:
-            if os.path.exists(memo[0]):
-                return _register_materialized(memo[0], memo[1], media_sink)
-            _REMOTE_MEDIA_MEMO.pop(url, None)
+        target_dir = _cache_dir_for_sink(media_sink)
+        with _REMOTE_MEDIA_MEMO_LOCK:
+            cached_hit = _resolve_memoized_remote_media(url, target_dir)
+        if cached_hit is not None:
+            return _register_materialized(cached_hit[0], cached_hit[1], media_sink)
         try:
             req = urllib.request.Request(
                 url, headers={"User-Agent": "Hermes-Agent"}
@@ -526,13 +658,15 @@ def _materialize_media(
                         content_type,
                     )
                     return "", ""
-                result = _stream_download_to_cache(resp, ext)
+                result = _stream_download_to_cache(resp, ext, cache_dir=target_dir)
             if result is None:
                 return "", ""
-            if len(_REMOTE_MEDIA_MEMO) >= _REMOTE_MEDIA_MEMO_LIMIT:
-                for stale in list(_REMOTE_MEDIA_MEMO)[: _REMOTE_MEDIA_MEMO_LIMIT // 2]:
-                    _REMOTE_MEDIA_MEMO.pop(stale, None)
-            _REMOTE_MEDIA_MEMO[url] = result
+            with _REMOTE_MEDIA_MEMO_LOCK:
+                if len(_REMOTE_MEDIA_MEMO) >= _REMOTE_MEDIA_MEMO_LIMIT:
+                    evict_count = max(1, _REMOTE_MEDIA_MEMO_LIMIT // 2)
+                    for stale in list(_REMOTE_MEDIA_MEMO)[:evict_count]:
+                        _REMOTE_MEDIA_MEMO.pop(stale, None)
+                _REMOTE_MEDIA_MEMO[url] = result
             return _register_materialized(result[0], result[1], media_sink)
         except Exception as exc:
             logger.debug("Failed to download remote media URL %s: %s", url, exc)

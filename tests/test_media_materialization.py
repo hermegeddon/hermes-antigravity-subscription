@@ -20,6 +20,7 @@ offline and deterministically.
 from __future__ import annotations
 
 import base64
+import errno
 import http.server
 import os
 import sys
@@ -28,6 +29,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -391,6 +393,182 @@ class NativeMediaRootsTests(unittest.TestCase):
                 sys.modules["hermes_constants"] = saved
             else:
                 sys.modules.pop("hermes_constants", None)
+
+
+class SessionIsolationAndConcurrencyTests(unittest.TestCase):
+    def setUp(self):
+        agy_prompt._REMOTE_MEDIA_MEMO.clear()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        cache_patch = patch.object(
+            agy_prompt, "_media_cache_dir", lambda: self.tmp.name
+        )
+        cache_patch.start()
+        self.addCleanup(cache_patch.stop)
+        gate_patch = patch.object(
+            agy_prompt, "_host_is_publicly_fetchable", return_value=True
+        )
+        gate_patch.start()
+        self.addCleanup(gate_patch.stop)
+
+    def _new_client(self):
+        import client as agy_client
+
+        cl = agy_client.AntigravityClient()
+        self.addCleanup(cl.close)
+        return cl
+
+    def test_concurrent_clients_isolate_data_url_lifecycle(self):
+        raw = b"\x89PNG\r\n\x1a\nconcurrent-data"
+        data_url = "data:image/png;base64," + base64.b64encode(raw).decode()
+        cl1 = self._new_client()
+        cl2 = self._new_client()
+
+        fpath1, kind1 = agy_prompt._materialize_media(
+            data_url, cl1._materialized_media
+        )
+        fpath2, kind2 = agy_prompt._materialize_media(
+            data_url, cl2._materialized_media
+        )
+
+        self.assertEqual((kind1, kind2), ("Image", "Image"))
+        self.assertNotEqual(fpath1, fpath2)
+        dir1 = os.path.dirname(fpath1)
+        dir2 = os.path.dirname(fpath2)
+        self.assertTrue(os.path.basename(dir1).startswith("session_"))
+        self.assertTrue(os.path.basename(dir2).startswith("session_"))
+        self.assertEqual(os.path.dirname(dir1), self.tmp.name)
+        self.assertEqual(os.path.dirname(dir2), self.tmp.name)
+        self.assertEqual(Path(fpath1).read_bytes(), raw)
+        self.assertEqual(Path(fpath2).read_bytes(), raw)
+
+        cl1.close()
+        self.assertFalse(os.path.exists(fpath1))
+        self.assertFalse(os.path.exists(dir1))
+        self.assertTrue(os.path.isfile(fpath2))
+        self.assertEqual(Path(fpath2).read_bytes(), raw)
+
+        cl2.close()
+        self.assertFalse(os.path.exists(fpath2))
+        self.assertFalse(os.path.exists(dir2))
+        self.assertEqual(os.listdir(self.tmp.name), [])
+
+    def test_concurrent_clients_reuse_remote_cache_and_redownload_after_close(self):
+        body = b"\x89PNG" * 64
+        with _LocalServer(body, "image/png") as server:
+            cl1 = self._new_client()
+            cl2 = self._new_client()
+            cl3 = self._new_client()
+
+            fpath1, kind1 = agy_prompt._materialize_media(
+                server.url, cl1._materialized_media
+            )
+            self.assertEqual(kind1, "Image")
+            self.assertEqual(server.hits, 1)
+
+            fpath2, kind2 = agy_prompt._materialize_media(
+                server.url, cl2._materialized_media
+            )
+            self.assertEqual(kind2, "Image")
+            self.assertEqual(server.hits, 1)
+            self.assertNotEqual(fpath1, fpath2)
+            self.assertEqual(Path(fpath2).read_bytes(), body)
+
+            cl1.close()
+            self.assertFalse(os.path.exists(fpath1))
+            self.assertFalse(os.path.exists(os.path.dirname(fpath1)))
+            self.assertTrue(os.path.isfile(fpath2))
+            self.assertEqual(Path(fpath2).read_bytes(), body)
+
+            cl2.close()
+            self.assertFalse(os.path.exists(fpath2))
+            self.assertFalse(os.path.exists(os.path.dirname(fpath2)))
+
+            fpath3, kind3 = agy_prompt._materialize_media(
+                server.url, cl3._materialized_media
+            )
+            self.assertEqual(kind3, "Image")
+            self.assertEqual(server.hits, 2)
+            self.assertTrue(os.path.isfile(fpath3))
+            self.assertEqual(Path(fpath3).read_bytes(), body)
+
+            cl3.close()
+            self.assertEqual(os.listdir(self.tmp.name), [])
+
+    def test_memo_clone_falls_back_to_copy_when_hardlink_fails(self):
+        body = b"\x89PNGfallback" * 16
+        with _LocalServer(body, "image/png") as server:
+            cl1 = self._new_client()
+            cl2 = self._new_client()
+
+            fpath1, _ = agy_prompt._materialize_media(
+                server.url, cl1._materialized_media
+            )
+            with patch.object(
+                agy_prompt.os,
+                "link",
+                side_effect=OSError(errno.EXDEV, "cross-device link"),
+            ):
+                fpath2, kind2 = agy_prompt._materialize_media(
+                    server.url, cl2._materialized_media
+                )
+
+            self.assertEqual(kind2, "Image")
+            self.assertEqual(server.hits, 1)
+            self.assertNotEqual(fpath1, fpath2)
+            self.assertEqual(Path(fpath2).read_bytes(), body)
+            self.assertEqual(
+                [
+                    name
+                    for name in os.listdir(os.path.dirname(fpath2))
+                    if name.endswith(".part")
+                ],
+                [],
+            )
+
+            cl1.close()
+            self.assertTrue(os.path.isfile(fpath2))
+            cl2.close()
+            self.assertEqual(os.listdir(self.tmp.name), [])
+
+    def test_cleanup_session_media_preserves_cache_root_directory(self):
+        agy_prompt.cleanup_session_media(set(), cache_dir=self.tmp.name)
+        self.assertTrue(os.path.isdir(self.tmp.name))
+
+    def test_concurrent_remote_memo_eviction_stress(self):
+        body = b"\x89PNG" * 32
+        handler = type(
+            "ThreadedHandler",
+            (_Handler,),
+            {"body": body, "content_type": "image/png", "hits": 0},
+        )
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(lambda: (httpd.shutdown(), httpd.server_close(), thread.join(timeout=5)))
+        base_url = f"http://127.0.0.1:{httpd.server_port}/media"
+
+        def worker(worker_idx: int) -> None:
+            for step in range(20):
+                sink = agy_prompt._SessionMediaSink()
+                try:
+                    url = f"{base_url}/{(worker_idx * 5 + step) % 12}"
+                    fpath, kind = agy_prompt._materialize_media(url, sink)
+                    self.assertEqual(kind, "Image")
+                    self.assertTrue(os.path.isfile(fpath))
+                    self.assertEqual(Path(fpath).read_bytes(), body)
+                finally:
+                    agy_prompt.cleanup_session_media(
+                        set(sink), cache_dir=sink.cache_dir
+                    )
+
+        with patch.object(agy_prompt, "_REMOTE_MEDIA_MEMO_LIMIT", 4):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = [pool.submit(worker, idx) for idx in range(8)]
+                for future in futures:
+                    future.result()
+
+        self.assertEqual(os.listdir(self.tmp.name), [])
 
 
 if __name__ == "__main__":
