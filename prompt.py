@@ -8,6 +8,7 @@ import ipaddress
 import json
 import logging
 import mimetypes
+import ntpath
 import os
 import pathlib
 import re
@@ -315,9 +316,10 @@ def _is_plugin_owned_media_path(path: str) -> bool:
     """
     if not path:
         return False
-    cache_root = os.path.realpath(_media_cache_dir())
-    real = os.path.realpath(path)
-    return real == cache_root or real.startswith(cache_root + os.sep)
+    cache_root = os.path.normcase(os.path.realpath(_media_cache_dir()))
+    real = os.path.normcase(os.path.realpath(path))
+    prefix = cache_root if cache_root.endswith(os.sep) else cache_root + os.sep
+    return real == cache_root or real.startswith(prefix)
 
 
 def _register_materialized(
@@ -345,8 +347,34 @@ def _mime_kind(mime: str) -> str:
     return "Image"
 
 
+_WIN_DRIVE_NETLOC_RE = re.compile(r"^[A-Za-z]:(?:$|\\)")
+_WIN_SLASHED_DRIVE_RE = re.compile(r"^/[A-Za-z]:[\\/]")
+_WIN_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
 def unquote_path(path: str) -> str:
     return urllib.parse.unquote(path or "")
+
+
+def _resolve_file_uri_path(url: str) -> str | None:
+    """Resolve a local file:// URI to a filesystem path, or None if refused."""
+    parsed = urllib.parse.urlsplit(url)
+    if _WIN_DRIVE_NETLOC_RE.match(parsed.netloc):
+        # urlsplit leaves Windows backslash paths (e.g. file://C:\foo\pic.png)
+        # inside netloc and keeps "C:" in netloc for file://C:/foo/pic.png.
+        local = unquote_path(parsed.netloc) + unquote_path(parsed.path)
+        return ntpath.normpath(local)
+
+    if parsed.netloc not in ("", "localhost"):
+        logger.debug("Refused file:// URI with host: %s", parsed.netloc)
+        return None
+
+    local = unquote_path(parsed.path)
+    if _WIN_SLASHED_DRIVE_RE.match(local):
+        return ntpath.normpath(local[1:])
+    if _WIN_DRIVE_PREFIX_RE.match(local):
+        return ntpath.normpath(local)
+    return local
 
 
 def _stream_download_to_cache(resp: Any, ext: str) -> Optional[tuple[str, str]]:
@@ -442,12 +470,10 @@ def _materialize_media(
             return "", ""
 
     # 2. file:// URI (local host only, no credentials/host indirection)
-    if url.startswith("file://"):
-        parsed = urllib.parse.urlsplit(url)
-        if parsed.netloc not in ("", "localhost"):
-            logger.debug("Refused file:// URI with host: %s", parsed.netloc)
+    if url.lower().startswith("file://"):
+        local = _resolve_file_uri_path(url)
+        if local is None:
             return "", ""
-        local = unquote_path(parsed.path)
         kind = _local_media_kind(local)
         if kind is None:
             return "", ""
@@ -455,7 +481,11 @@ def _materialize_media(
         # survive (agy's read of a missing file fails harmlessly).
         target_path = (
             local
-            if local.startswith(("/", "\\")) or os.path.isabs(local)
+            if (
+                local.startswith(("/", "\\"))
+                or os.path.isabs(local)
+                or pathlib.PureWindowsPath(local).is_absolute()
+            )
             else os.path.abspath(local)
         )
         return _register_materialized(target_path, kind, media_sink)
