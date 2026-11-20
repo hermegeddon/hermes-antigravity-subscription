@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import ntpath
 import os
 import re
 import subprocess
@@ -59,6 +60,18 @@ logger = logging.getLogger(__name__)
 _NATIVE_MEDIA_TOOLS = frozenset({"read_file", "view_file"})
 
 
+_NATIVE_MEDIA_ROOT_SUBDIRS = (
+    "cache",
+    "uploads",
+    "attachments",
+    "browser_screenshots",
+    "composer-pastes",
+    "image_cache",
+    "audio_cache",
+    "hosted-room-attachments",
+)
+
+
 def _native_media_roots() -> tuple[str, ...]:
     try:
         from hermes_constants import get_hermes_home
@@ -67,35 +80,163 @@ def _native_media_roots() -> tuple[str, ...]:
             return os.path.join(os.path.expanduser("~"), ".hermes")
 
     hermes_home = str(get_hermes_home())
-    roots = [
-        os.path.join(hermes_home, "cache"),
-        os.path.join(hermes_home, "uploads"),
-        os.path.join(hermes_home, "attachments"),
-        os.path.join(hermes_home, "browser_screenshots"),
-        os.path.join(hermes_home, "composer-pastes"),
-    ]
+    roots = [os.path.join(hermes_home, subdir) for subdir in _NATIVE_MEDIA_ROOT_SUBDIRS]
     try:
         import tempfile
 
         roots.append(tempfile.gettempdir())
     except Exception:
         roots.append("/tmp")
-    return tuple(os.path.realpath(r) for r in roots)
+    return tuple(os.path.normcase(os.path.realpath(r)) for r in roots)
 
 
-_TOOL_INFO_PATH_RE = re.compile(r"/[A-Za-z0-9_\-./]+")
+_WIN_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_TOOL_INFO_PATH_RE = re.compile(r"(?<![A-Za-z0-9_/\\.-])(/[A-Za-z0-9_\-./]+)")
+_TOOL_CALL_WRAPPER_RE = re.compile(r"^\s*(?:read_file|view_file)\((.+)\)\s*$")
+_DOUBLE_QUOTED_RE = re.compile(r'"([^"\r\n]+)"')
+_SINGLE_QUOTED_RE = re.compile(r"(?:^|[\s(=:,])'([^'\r\n]+)'(?=$|[\s),;:])")
+_UNQUOTED_WIN_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\"<>\r\n|?*()]+")
+_SLASH_RUN_RE = re.compile(r"[\\/]+")
+_TRAILING_BOUNDARY_CHARS = frozenset({")", "]", "}", ",", ";", ":"})
+_DISALLOWED_LEADING_CHARS = frozenset({"/", "_", "-", "."})
+
+
+def _normalize_path_key(path: str) -> str:
+    """Normalize a local path for case- and separator-insensitive comparison."""
+    if _WIN_DRIVE_PATH_RE.match(path):
+        # Use ntpath even on POSIX hosts so Windows drive refs match cross-OS.
+        return ntpath.normpath(path).lower()
+    return os.path.normcase(os.path.normpath(path))
+
+
+def _looks_like_abs_path(value: str) -> bool:
+    return bool(_WIN_DRIVE_PATH_RE.match(value) or value.startswith("/"))
+
+
+def _strip_double_quoted(text: str) -> tuple[list[str], str]:
+    found: list[str] = []
+
+    def _take(match: re.Match[str]) -> str:
+        val = match.group(1).strip()
+        if _looks_like_abs_path(val):
+            found.append(val)
+        return " "
+
+    return found, _DOUBLE_QUOTED_RE.sub(_take, text)
+
+
+def _strip_single_quoted(text: str) -> tuple[list[str], str]:
+    found: list[str] = []
+    parts: list[str] = []
+    cursor = 0
+    for match in _SINGLE_QUOTED_RE.finditer(text):
+        val = match.group(1).strip()
+        if _looks_like_abs_path(val):
+            found.append(val)
+        quote_start = match.start(1) - 1
+        quote_end = match.end(1) + 1
+        parts.append(text[cursor:quote_start])
+        parts.append(" ")
+        cursor = quote_end
+    parts.append(text[cursor:])
+    return found, "".join(parts)
+
+
+def _extract_tool_info_paths(tool_info: str) -> tuple[list[str], str]:
+    """Extract candidate paths from tool_info, returning (candidates, unquoted)."""
+    if not tool_info:
+        return [], ""
+
+    dq_paths, after_dq = _strip_double_quoted(tool_info)
+    sq_paths, unquoted = _strip_single_quoted(after_dq)
+    candidates = [*dq_paths, *sq_paths]
+
+    if wrapper := _TOOL_CALL_WRAPPER_RE.match(unquoted):
+        inner = wrapper.group(1).strip()
+        if inner and _looks_like_abs_path(inner):
+            candidates.append(inner)
+
+    for match in _UNQUOTED_WIN_PATH_RE.findall(unquoted):
+        cleaned = match.strip().rstrip(".,;:")
+        if cleaned:
+            candidates.append(cleaned)
+
+    for match in _TOOL_INFO_PATH_RE.findall(unquoted):
+        cleaned = match.rstrip(".")
+        if cleaned:
+            candidates.append(cleaned)
+
+    return candidates, unquoted
+
+
+def _has_bounded_token(haystack: str, needle: str) -> bool:
+    start = 0
+    while True:
+        idx = haystack.find(needle, start)
+        if idx == -1:
+            return False
+        end = idx + len(needle)
+        lead_ok = idx == 0 or (
+            not haystack[idx - 1].isalnum()
+            and haystack[idx - 1] not in _DISALLOWED_LEADING_CHARS
+        )
+        if end == len(haystack):
+            trail_ok = True
+        else:
+            after = haystack[end]
+            trail_ok = (
+                after.isspace()
+                or after in _TRAILING_BOUNDARY_CHARS
+                or (
+                    after == "."
+                    and (end + 1 == len(haystack) or haystack[end + 1].isspace())
+                )
+            )
+        if lead_ok and trail_ok:
+            return True
+        start = idx + 1
+
+
+def _match_referenced_in_unquoted(unquoted: str, referenced: set[str]) -> bool:
+    """Match referenced paths inside unquoted prose with strict token boundaries."""
+    if not unquoted or not referenced:
+        return False
+    text_canon = _SLASH_RUN_RE.sub("/", unquoted)
+    text_lower = text_canon.lower()
+
+    for ref in referenced:
+        if not ref:
+            continue
+        is_win = bool(_WIN_DRIVE_PATH_RE.match(ref))
+        norm_ref = ntpath.normpath(ref) if is_win else os.path.normpath(ref)
+        ref_canon = _SLASH_RUN_RE.sub("/", norm_ref)
+        haystack, needle = (
+            (text_lower, ref_canon.lower())
+            if is_win or os.name == "nt"
+            else (text_canon, ref_canon)
+        )
+        if _has_bounded_token(haystack, needle):
+            return True
+    return False
 
 
 def _path_is_native_media_target(path: str, referenced: set[str]) -> bool:
-    normalized = os.path.normpath(path)
-    if normalized in referenced:
+    if not path:
+        return False
+    key = _normalize_path_key(path)
+    if any(_normalize_path_key(ref) == key for ref in referenced if ref):
         return True
-    real = os.path.realpath(normalized)
+    # On POSIX hosts a Windows drive path is not local; keep realpath() from
+    # treating it as relative to cwd (which could sit under /tmp).
+    if os.name != "nt" and _WIN_DRIVE_PATH_RE.match(path):
+        return False
+    normalized = ntpath.normpath(path) if _WIN_DRIVE_PATH_RE.match(path) else os.path.normpath(path)
+    real = os.path.normcase(os.path.realpath(normalized))
     # Resolved at use time: a Hermes process serving several profiles must
     # evaluate the roots of the profile owning this session (review
     # 5887913331, point 2).
     return any(
-        real == root or real.startswith(root + os.sep)
+        real == root or real.startswith(root if root.endswith(os.sep) else root + os.sep)
         for root in _native_media_roots()
     )
 
@@ -518,10 +659,11 @@ class AntigravityStream(Iterator[Any]):
         """
         if tool_name not in _NATIVE_MEDIA_TOOLS:
             return False
-        for candidate in _TOOL_INFO_PATH_RE.findall(tool_info):
+        candidates, unquoted = _extract_tool_info_paths(tool_info)
+        for candidate in candidates:
             if _path_is_native_media_target(candidate, self._media_paths):
                 return True
-        return False
+        return _match_referenced_in_unquoted(unquoted, self._media_paths)
 
     def close(self) -> None:
         if self._closed:
