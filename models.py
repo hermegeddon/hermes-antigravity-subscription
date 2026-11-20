@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import subprocess
+import tempfile
 import threading
 import time
 from typing import Any
@@ -137,28 +139,68 @@ def load_catalog(
     again.
     """
     global _catalog_cache
-    try:
-        from .process import _no_window, resolve_agy_command
-    except ImportError:
-        from process import _no_window, resolve_agy_command
 
     with _catalog_lock:
         if only_if_stale:
             fresh = _cached_catalog()
             if fresh is not None:
                 return fresh
+
+        # Imported per-call to avoid a circular top-level import with client.py
+        # and to preserve testability when process.* attributes are patched.
         try:
+            from .client import _force_rmtree
+            from .process import (
+                _no_window,
+                build_child_env,
+                reap_orphaned_plugin_workers,
+                resolve_agy_command,
+                setup_isolated_home,
+            )
+        except ImportError:
+            from client import _force_rmtree
+            from process import (
+                _no_window,
+                build_child_env,
+                reap_orphaned_plugin_workers,
+                resolve_agy_command,
+                setup_isolated_home,
+            )
+
+        tmp_dir: str | None = None
+        timed_out = False
+        catalog: dict[str, tuple[str, ...]] = {}
+        try:
+            tmp_dir = tempfile.mkdtemp(prefix="hermes_agy_models_")
+            isolated_home, _ = setup_isolated_home(tmp_dir)
+            env = build_child_env(isolated_home)
             res = subprocess.run(
                 [resolve_agy_command(), "models"],
+                env=env,
+                cwd=tmp_dir,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 **_no_window(),
             )
-            catalog = parse_catalog(res.stdout)
+            catalog = parse_catalog(res.stdout or "")
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            logger.debug("Antigravity model catalog timed out after %.1fs: %s", timeout, exc)
+            catalog = {}
         except Exception as exc:
             logger.debug("Antigravity model catalog unavailable: %s", exc)
             catalog = {}
+        finally:
+            if tmp_dir is not None:
+                _force_rmtree(tmp_dir)
+            if timed_out:
+                # Delete tmp_dir first so the reaper identifies any surviving child as orphaned.
+                with contextlib.suppress(Exception):
+                    reap_orphaned_plugin_workers()
+
         ttl = _CATALOG_TTL_SECONDS if catalog else _CATALOG_FAILURE_TTL_SECONDS
         _catalog_cache = (time.monotonic() + ttl, catalog)
         return catalog
