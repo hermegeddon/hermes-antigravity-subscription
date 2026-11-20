@@ -29,7 +29,9 @@ script is executed in-process against a stubbed ``secretstorage`` module.
 
 import ast
 import contextlib
+import ntpath
 import os
+import posixpath
 import subprocess
 import sys
 import tempfile
@@ -37,7 +39,7 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 plugin_dir = Path(__file__).resolve().parent.parent
 if str(plugin_dir) not in sys.path:
@@ -170,6 +172,9 @@ def _no_token_file(platform="linux", os_name="posix"):
         mock_os = stack.enter_context(patch("process.os", wraps=os))
         mock_sys = stack.enter_context(patch("process.sys", wraps=sys))
         mock_os.name = os_name
+        # Match os.path to the simulated OS: on Windows Python 3.13+,
+        # ntpath.isabs('/opt/...') is False and rejects POSIX paths.
+        mock_os.path = MagicMock(wraps=ntpath if os_name == "nt" else posixpath)
         mock_sys.platform = platform
         yield
 

@@ -261,17 +261,12 @@ class StderrDrainTests(unittest.TestCase):
         )
         self.assertEqual(stream._get_stderr_tail(), "direct fallback stderr\n")
 
-    @unittest.skipIf(
-        os.name == "nt",
-        "mock agy script with shebang is not executable on Windows",
-    )
     def test_worker_turn_with_large_stderr_does_not_hang(self) -> None:
         """Persistent worker emitting >=4 MiB to stderr during a turn completes without hanging."""
-        # Pipe capacity on Linux is 16 pages: 64 KiB with 4 KiB pages (x86_64),
-        # but 1 MiB on systems with 64 KiB pages (e.g. Linux arm64). Writing
-        # 4 MiB (4096 lines of 1 KiB) guarantees saturating the pipe buffer
-        # across all page sizes, hanging the child process unless stderr is
-        # actively drained concurrently.
+        # Pipe capacity is ~4 KiB on Windows anonymous pipes, 64 KiB on Linux
+        # x86_64 (16 x 4 KiB pages), and up to 1 MiB on 64 KiB page systems
+        # (e.g. Linux arm64). Writing 4 MiB guarantees saturating the pipe
+        # buffer across all platforms, hanging the child unless drained concurrently.
         tmp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(tmp_dir.cleanup)
         client = AntigravityClient(cwd=tmp_dir.name)
@@ -290,17 +285,28 @@ class StderrDrainTests(unittest.TestCase):
             "    print(json.dumps({'event': 'init', 'conversation_id': 'worker-1'}))\n"
             "    print(json.dumps({'event': 'step_update', 'step_update': {'text_delta': 'worker done'}}))\n"
             "    print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', 'response': 'worker done', 'usage': {}}}))\n"
-            "    sys.stdout.flush()\n"
+            "    sys.stdout.flush()\n",
+            encoding="utf-8",
         )
         mock_agy.chmod(0o755)
         client._command = str(mock_agy)
         client._args = []
 
-        res = client.chat.completions.create(
-            model="gemini-3.8-flash",
-            messages=[{"role": "user", "content": "turn 1"}],
-            stream=False,
-        )
+        real_popen = subprocess.Popen
+
+        def spawn_mock_agy(argv, *args, **kwargs):
+            # Windows cannot execute POSIX #! shebang scripts directly; invoke
+            # Python explicitly while keeping real pipes and process-group flags.
+            if os.name == "nt" and argv and argv[0] == str(mock_agy):
+                argv = [sys.executable, "-B", str(mock_agy), *argv[1:]]
+            return real_popen(argv, *args, **kwargs)
+
+        with patch("client.subprocess.Popen", side_effect=spawn_mock_agy):
+            res = client.chat.completions.create(
+                model="gemini-3.8-flash",
+                messages=[{"role": "user", "content": "turn 1"}],
+                stream=False,
+            )
         self.assertEqual(res.choices[0].message.content, "worker done")
 
         worker_proc = client._worker_proc

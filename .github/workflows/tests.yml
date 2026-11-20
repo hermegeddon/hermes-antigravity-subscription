@@ -3,7 +3,9 @@ name: Tests
 # PR / branch CI. release.yml is tag-only and never runs on branches, so
 # without this workflow a PR could merge code the release gate would reject.
 # This workflow runs the plugin test suite on every pull request and on
-# pushes to main, on Linux and Windows with Python 3.11.
+# pushes to main, on Linux and Windows with Python 3.11 and 3.13 (3.13
+# exercises Python 3.13+'s stricter Windows ntpath.isabs semantics while
+# staying within HERMES_REF v2026.9.21's <3.14 ceiling).
 #
 # Hermes is built from the upstream source at a pinned tag, NOT from PyPI:
 # the PyPI wheel lags (0.19.0) below the plugin's requires_hermes floor
@@ -38,15 +40,16 @@ env:
 
 jobs:
   tests:
-    name: tests (${{ matrix.os }})
+    name: tests (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
-      # Report both platforms even if one fails; a Windows-only failure
-      # must not hide behind (or hide) the Ubuntu result.
+      # Report every leg even if one fails; a Windows-only or Python-3.13+
+      # failure must not hide behind (or hide) another matrix entry.
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,7 +59,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       - name: Guard against HERMES_REF drift with release.yml
         # Both workflows pin the upstream Hermes tag independently. A bump
@@ -109,8 +112,7 @@ jobs:
 
       - name: Validate the plugin manifest (POSIX)
         # Mirrors the release gate's other half (release.yml runs validate
-        # before its test step too). Kept on the non-Windows leg only, like
-        # the release gate, which is ubuntu-only.
+        # before its test step too).
         if: runner.os != 'Windows'
         run: hermes plugins validate "$GITHUB_WORKSPACE"
 
@@ -123,3 +125,8 @@ jobs:
         run: |
           $env:PYTHONPATH = "$env:RUNNER_TEMP/hermes-src;$env:GITHUB_WORKSPACE"
           python -m pytest tests/ -q
+
+      - name: Validate the plugin manifest (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: hermes plugins validate "$env:GITHUB_WORKSPACE"
