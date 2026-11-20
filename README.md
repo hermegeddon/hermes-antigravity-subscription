@@ -104,7 +104,7 @@ This default is a **name heuristic**: it cannot know what an arbitrarily named v
 | `ANTIGRAVITY_ENV_STRICT` | `1`, `true`, `yes` or `on`: pass only the baseline below plus `ANTIGRAVITY_ENV_ALLOWLIST` and `ANTIGRAVITY_ENV_PASSTHROUGH`. |
 | `ANTIGRAVITY_ENV_ALLOWLIST` | Comma-separated names to add in strict mode. |
 
-Strict baseline: `PATH`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `TERM`, `TMPDIR`/`TEMP`/`TMP`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` (and their lowercase spellings on POSIX), `SSL_CERT_FILE`, `SSL_CERT_DIR`, `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` (Linux keyring sign-in), `SYSTEMROOT`, `WINDIR`, `COMSPEC`, `PATHEXT` (Windows), `AGY_CLI_DISABLE_AUTO_UPDATE` and `AGY_CLI_MODEL_API_MAX_RETRIES`. Names are matched case-insensitively on Windows.
+Strict baseline: `PATH`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `TERM`, `TMPDIR`/`TEMP`/`TMP`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` (and their lowercase spellings on POSIX), `SSL_CERT_FILE`, `SSL_CERT_DIR`, `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` (Linux keyring sign-in), `SYSTEMROOT`, `WINDIR`, `COMSPEC`, `PATHEXT`, `APPDATA`, `LOCALAPPDATA`, `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `PROGRAMDATA` (Windows), `AGY_CLI_DISABLE_AUTO_UPDATE` and `AGY_CLI_MODEL_API_MAX_RETRIES`. Names are matched case-insensitively on Windows.
 
 ---
 
@@ -218,6 +218,13 @@ Multiple agy sessions on one account contend for the shared OAuth token: whoever
 > isolated HOME it gives `agy`; otherwise the child `agy` would ask you to log
 > in again. Nothing extra is required. Setting `ANTIGRAVITY_CONFIG_DIR` turns
 > both off and keeps the token-file path.
+
+> **Windows Credential Manager.** On Windows `agy` keeps its session in the
+> Credential Manager under target `gemini:antigravity`. Detection queries
+> `advapi32.CredReadW` with an opaque pointer (freeing it with `CredFree`
+> without reading `CredentialBlob`) and falls back to `cmdkey /list` only if
+> the API call cannot answer. Setting `ANTIGRAVITY_CONFIG_DIR` turns detection
+> off and keeps the token-file path.
 
 ---
 
