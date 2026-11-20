@@ -21,7 +21,7 @@ if str(plugin_dir) not in sys.path:
     sys.path.insert(0, str(plugin_dir))
 
 import process
-from process import resolve_real_token_path, setup_isolated_home
+from process import resolve_agy_command, resolve_real_token_path, setup_isolated_home
 
 LEGACY_NAME = "antigravity-oauth-token"
 NEW_NAME = "jetski-standalone-oauth-token"
@@ -248,6 +248,81 @@ class AuthFileCompatibilityTests(unittest.TestCase):
             self.assertTrue(os.path.islink(self_link), "self-path symlink must survive")
             self.assertTrue(self_link.exists(), "must not become a self-referential (ELOOP) link")
             self.assertEqual(os.path.realpath(self_link), os.path.realpath(external))
+
+    def test_resolve_real_token_path_skips_root_fallback_on_windows(self):
+        with tempfile.TemporaryDirectory() as home:
+            probed: list[str] = []
+
+            def fake_probe(path):
+                probed.append(str(path))
+                return "root" in Path(path).parts
+
+            with _scrubbed_env(HOME=home), patch("process.os", wraps=os) as mock_os, patch(
+                "process._is_existing_file", side_effect=fake_probe
+            ):
+                mock_os.name = "nt"
+                self.assertIsNone(resolve_real_token_path())
+            self.assertFalse(any("root" in Path(p).parts for p in probed))
+
+    def test_resolve_agy_command_windows_scoop_and_winget_candidates(self):
+        env_clear = {"ANTIGRAVITY_COMMAND": "", "AGY_CLI_PATH": "", "ANTIGRAVITY_CLI_PATH": ""}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            userprofile = root / "userprofile"
+            localappdata = root / "localappdata"
+            scoop_shim = userprofile / "scoop" / "shims" / "agy.exe"
+            scoop_shim.parent.mkdir(parents=True)
+            scoop_shim.write_text("", encoding="utf-8")
+
+            winget_pkg_old = localappdata / "Microsoft" / "WinGet" / "Packages" / "Google.AntigravityCLI_1.0.0"
+            winget_pkg_new = localappdata / "Microsoft" / "WinGet" / "Packages" / "Google.AntigravityCLI_2.0.0" / "bin"
+            winget_pkg_old.mkdir(parents=True)
+            winget_pkg_new.mkdir(parents=True)
+            (winget_pkg_old / "agy.exe").write_text("", encoding="utf-8")
+            winget_new_exe = winget_pkg_new / "agy.exe"
+            winget_new_exe.write_text("", encoding="utf-8")
+
+            with self.subTest("scoop shim"):
+                env = {**env_clear, "USERPROFILE": str(userprofile), "LOCALAPPDATA": str(localappdata)}
+                with patch.dict(os.environ, env, clear=False), patch(
+                    "process.Path.home", return_value=home
+                ), patch("process.shutil.which", return_value=None), patch(
+                    "process.os", wraps=os
+                ) as mock_os:
+                    mock_os.name = "nt"
+                    self.assertEqual(resolve_agy_command(), str(scoop_shim))
+
+            scoop_shim.unlink()
+            with self.subTest("winget packages"):
+                env = {**env_clear, "USERPROFILE": str(userprofile), "LOCALAPPDATA": str(localappdata)}
+                with patch.dict(os.environ, env, clear=False), patch(
+                    "process.Path.home", return_value=home
+                ), patch("process.shutil.which", return_value=None), patch(
+                    "process.os", wraps=os
+                ) as mock_os:
+                    mock_os.name = "nt"
+                    self.assertEqual(resolve_agy_command(), str(winget_new_exe))
+
+    def test_resolve_agy_command_skips_posix_root_dirs_on_windows(self):
+        env_clear = {"ANTIGRAVITY_COMMAND": "", "AGY_CLI_PATH": "", "ANTIGRAVITY_CLI_PATH": ""}
+        probed: list[str] = []
+
+        def fake_probe(path):
+            probed.append(Path(path).as_posix())
+            return False
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {**env_clear, "USERPROFILE": tmp, "LOCALAPPDATA": tmp}, clear=False
+        ), patch("process.Path.home", return_value=Path(tmp)), patch(
+            "process.shutil.which", return_value=None
+        ), patch("process._is_existing_file", side_effect=fake_probe), patch(
+            "process.os", wraps=os
+        ) as mock_os:
+            mock_os.name = "nt"
+            self.assertEqual(resolve_agy_command(), "agy")
+
+        self.assertFalse(any(p.startswith("/root/") or p.startswith("/usr/") for p in probed))
 
 
 if __name__ == "__main__":

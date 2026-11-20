@@ -745,15 +745,88 @@ class GatingTests(unittest.TestCase):
             run.assert_not_called()
 
     def test_nt_still_routes_to_cmdkey(self):
-        # PR #2's branch must keep serving Windows: sys.platform says "win32"
-        # there, and the Windows probe (not the Linux one) must answer.
+        # PR #2's branch must keep serving Windows when CredReadW cannot answer:
+        # sys.platform says "win32" there, and the cmdkey fallback answers.
         listed = SimpleNamespace(stdout=b"Target: LegacyGeneric:target=gemini:antigravity\r\n", returncode=0)
         for result, expected in ((listed, True), (SimpleNamespace(stdout=b"* NONE *\r\n", returncode=0), False)):
             with self.subTest(expected=expected), _no_token_file(platform="win32", os_name="nt"), _probe_env(), patch(
-                "process.subprocess.run", return_value=result
-            ) as run:
+                "process._advapi32_credential_present", return_value=None
+            ), patch("process.subprocess.run", return_value=result) as run:
                 self.assertIs(is_authenticated(), expected)
                 self.assertEqual(run.call_args.args[0], ["cmdkey", "/list:gemini:antigravity"])
+
+
+class WindowsCredReadTests(unittest.TestCase):
+    """Direct Win32 CredReadW probe on Windows and its fallback to cmdkey."""
+
+    @staticmethod
+    def _mock_advapi32(found: bool, err: int = 0, ptr_value: int = 0xDEAD):
+        advapi32 = MagicMock()
+
+        def cred_read(target, cred_type, flags, out_ptr):
+            if found:
+                out_ptr._obj.value = ptr_value
+                return 1
+            return 0
+
+        advapi32.CredReadW.side_effect = cred_read
+        return advapi32, lambda _name, use_last_error=False: advapi32, lambda: err
+
+    def test_credread_hit_returns_true_frees_pointer_and_skips_subprocess(self):
+        advapi32, win_dll, get_last_error = self._mock_advapi32(found=True, ptr_value=0x1234)
+        with _no_token_file(platform="win32", os_name="nt"), _probe_env(), patch.object(
+            process.ctypes, "WinDLL", create=True, side_effect=win_dll
+        ), patch.object(
+            process.ctypes, "get_last_error", create=True, side_effect=get_last_error
+        ), patch("process.subprocess.run") as run:
+            self.assertIs(is_authenticated(), True)
+            run.assert_not_called()
+
+        advapi32.CredReadW.assert_called_once()
+        self.assertEqual(advapi32.CredReadW.call_args.args[:3], ("gemini:antigravity", 1, 0))
+        advapi32.CredFree.assert_called_once()
+        self.assertEqual(advapi32.CredFree.call_args.args[0].value, 0x1234)
+
+    def test_credread_definitive_miss_returns_false_without_subprocess(self):
+        for err in (1168, 1312):
+            advapi32, win_dll, get_last_error = self._mock_advapi32(found=False, err=err)
+            with self.subTest(err=err), _no_token_file(platform="win32", os_name="nt"), _probe_env(), patch.object(
+                process.ctypes, "WinDLL", create=True, side_effect=win_dll
+            ), patch.object(
+                process.ctypes, "get_last_error", create=True, side_effect=get_last_error
+            ), patch("process.subprocess.run") as run:
+                self.assertIs(is_authenticated(), False)
+                run.assert_not_called()
+            advapi32.CredFree.assert_not_called()
+
+    def test_credread_unexpected_error_returns_none_and_falls_back_to_cmdkey(self):
+        _advapi32, win_dll, get_last_error = self._mock_advapi32(found=False, err=5)
+        listed = SimpleNamespace(stdout=b"Target: LegacyGeneric:target=gemini:antigravity\r\n", returncode=0)
+        with _no_token_file(platform="win32", os_name="nt"), _probe_env(), patch.object(
+            process.ctypes, "WinDLL", create=True, side_effect=win_dll
+        ), patch.object(
+            process.ctypes, "get_last_error", create=True, side_effect=get_last_error
+        ), patch("process.subprocess.run", return_value=listed) as run:
+            self.assertIsNone(process._advapi32_credential_present())
+            self.assertIs(is_authenticated(), True)
+            self.assertEqual(run.call_args.args[0], ["cmdkey", "/list:gemini:antigravity"])
+
+    def test_credread_missing_windll_or_oserror_falls_back_cleanly(self):
+        with _no_token_file(platform="win32", os_name="nt"), _probe_env(), patch.object(
+            process.ctypes, "WinDLL", create=True, side_effect=OSError("advapi32 missing")
+        ), patch("process.subprocess.run", return_value=SimpleNamespace(stdout=b"* NONE *\r\n", returncode=0)) as run:
+            self.assertIsNone(process._advapi32_credential_present())
+            self.assertIs(is_authenticated(), False)
+            run.assert_called_once()
+
+    def test_windows_constants_cohere_with_service_and_username(self):
+        self.assertEqual(
+            process._WINDOWS_CRED_TARGET,
+            f"{process._KEYRING_SERVICE}:{process._KEYRING_USERNAME}",
+        )
+        self.assertEqual(process._CRED_TYPE_GENERIC, 1)
+        self.assertEqual(process._ERROR_NOT_FOUND, 1168)
+        self.assertEqual(process._ERROR_NO_SUCH_LOGON_SESSION, 1312)
 
 
 class ConstantCoherenceTests(unittest.TestCase):

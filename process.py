@@ -6,6 +6,7 @@ import atexit
 import contextlib
 import ctypes
 import logging
+import ntpath
 import os
 import re
 import shutil
@@ -18,6 +19,10 @@ from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Capture real Popen class at import time so tests patching `subprocess.Popen`
+# with a MagicMock instance do not break isinstance() checks with TypeError.
+_REAL_POPEN_TYPE = subprocess.Popen
 
 # Marker scheme for Antigravity local provider
 AGY_MARKER_BASE_URL = "agy://local"
@@ -164,6 +169,123 @@ def _pdeathsig_preexec(parent_pid: int) -> Any:
     return _set_pdeathsig
 
 
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
+_JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+_WINDOWS_JOB_LOCK = threading.Lock()
+_WINDOWS_JOB_HANDLE: int | None = None
+
+
+class _JobObjectBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    ]
+
+
+class _JobObjectExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JobObjectBasicLimitInformation),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+def _get_windows_job_handle(kernel32: Any) -> int | None:
+    """Create and configure the module-level kill-on-close Windows Job Object."""
+    global _WINDOWS_JOB_HANDLE
+    with _WINDOWS_JOB_LOCK:
+        if _WINDOWS_JOB_HANDLE is not None:
+            return _WINDOWS_JOB_HANDLE
+
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+        kernel32.SetInformationJobObject.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        kernel32.SetInformationJobObject.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+
+        info = _JobObjectExtendedLimitInformation()
+        info.BasicLimitInformation.LimitFlags = (
+            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | _JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        )
+        if not kernel32.SetInformationJobObject(
+            job,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            kernel32.CloseHandle(job)
+            return None
+
+        # Intentionally never closed during normal runtime so only host exit
+        # closes the handle and triggers OS cleanup of attached children.
+        _WINDOWS_JOB_HANDLE = int(job)
+        return _WINDOWS_JOB_HANDLE
+
+
+def _assign_windows_job_object(proc: subprocess.Popen) -> bool:
+    """Assign a live Windows child to the module-level kill-on-close Job Object."""
+    if os.name != "nt":
+        return False
+    handle = getattr(proc, "_handle", None)
+    if not isinstance(handle, int) or isinstance(handle, bool) or handle <= 0:
+        return False
+    win_dll = getattr(ctypes, "WinDLL", None)
+    if win_dll is None:
+        return False
+
+    try:
+        kernel32 = win_dll("kernel32", use_last_error=True)
+        job_handle = _get_windows_job_handle(kernel32)
+        if job_handle is None:
+            return False
+        kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+        if not kernel32.AssignProcessToJobObject(job_handle, int(handle)):
+            err = ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else None
+            logger.debug(
+                "AssignProcessToJobObject failed for pid=%s (winerr=%s)",
+                getattr(proc, "pid", None),
+                err,
+            )
+            return False
+        return True
+    except (OSError, AttributeError):
+        return False
+
+
 # Processes this host owns, so a normal interpreter exit never orphans agy
 # even when client close() paths are skipped (issue #50).
 _TRACKED_PROCS: set[subprocess.Popen] = set()
@@ -173,6 +295,7 @@ _TRACKED_LOCK = threading.Lock()
 def register_tracked_process(proc: subprocess.Popen) -> None:
     with _TRACKED_LOCK:
         _TRACKED_PROCS.add(proc)
+    _assign_windows_job_object(proc)
 
 
 def unregister_tracked_process(proc: subprocess.Popen) -> None:
@@ -211,6 +334,12 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
                 check=False,
                 **_no_window(),
             )
+        if isinstance(proc, _REAL_POPEN_TYPE):
+            if proc.poll() is None:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=2)
         unregister_tracked_process(proc)
         return
     try:
@@ -227,6 +356,12 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
 
 def terminate_process(proc: subprocess.Popen) -> None:
     """Attempt graceful termination, falling back to process-tree kill."""
+    # On Windows, Popen.terminate() kills only the root process and leaves
+    # grandchildren alive; once the root dies, _kill_process_tree's poll()
+    # guard would skip taskkill /F /T. Kill the whole tree directly.
+    if os.name == "nt" and isinstance(proc, _REAL_POPEN_TYPE):
+        _kill_process_tree(proc)
+        return
     try:
         proc.terminate()
         proc.wait(timeout=2)
@@ -314,6 +449,30 @@ def start_stderr_drainer(proc: subprocess.Popen, max_chars: int = _DEFAULT_STDER
     return drainer
 
 
+def _windows_agy_candidates(binary_name: str) -> list[Path]:
+    """Return Windows-specific fallback locations for the agy CLI binary."""
+    home = Path.home()
+    candidates = [home / "scoop" / "shims" / binary_name]
+    if userprofile := os.getenv("USERPROFILE", "").strip():
+        up_path = Path(userprofile)
+        if up_path != home:
+            candidates.append(up_path / "scoop" / "shims" / binary_name)
+    if localappdata := os.getenv("LOCALAPPDATA", "").strip():
+        local_root = Path(localappdata)
+        candidates.append(local_root / "Programs" / "agy" / binary_name)
+        candidates.append(local_root / "Microsoft" / "WinGet" / "Links" / binary_name)
+        packages_dir = local_root / "Microsoft" / "WinGet" / "Packages"
+        with contextlib.suppress(OSError):
+            for pkg in sorted(packages_dir.glob("Google.AntigravityCLI_*"), reverse=True):
+                candidates.append(pkg / binary_name)
+                with contextlib.suppress(OSError):
+                    if pkg.is_dir():
+                        for child in sorted(pkg.iterdir()):
+                            if child.is_dir():
+                                candidates.append(child / binary_name)
+    return candidates
+
+
 def resolve_agy_command() -> str:
     """Find the path to the official `agy` binary across platforms."""
     for var in ("ANTIGRAVITY_COMMAND", "AGY_CLI_PATH", "ANTIGRAVITY_CLI_PATH"):
@@ -330,14 +489,15 @@ def resolve_agy_command() -> str:
     candidates = [
         Path.home() / ".gemini" / "antigravity-cli" / "bin" / binary_name,
         Path.home() / ".local" / "bin" / binary_name,
-        Path("/root/.local/bin") / binary_name,
-        Path("/usr/local/bin") / binary_name,
-        Path("/usr/bin") / binary_name,
     ]
     if os.name == "nt":
-        if localappdata := os.getenv("LOCALAPPDATA"):
-            candidates.append(Path(localappdata) / "Programs" / "agy" / binary_name)
-            candidates.append(Path(localappdata) / "Microsoft" / "WinGet" / "Links" / binary_name)
+        candidates.extend(_windows_agy_candidates(binary_name))
+    else:
+        candidates.extend([
+            Path("/root/.local/bin") / binary_name,
+            Path("/usr/local/bin") / binary_name,
+            Path("/usr/bin") / binary_name,
+        ])
 
     for candidate in candidates:
         if _is_existing_file(candidate) and (os.name == "nt" or os.access(candidate, os.X_OK)):
@@ -364,15 +524,21 @@ def resolve_real_token_path() -> Path | None:
                 return explicit
         return None
 
-    home_base = Path.home() / ".gemini" / "antigravity-cli"
-    root_base = Path("/root/.gemini/antigravity-cli")
-    candidates = [home_base / name for name in _TOKEN_FILENAMES]
-    # Last resort for containers/sudo contexts where HOME does not point
+    candidates: list[Path] = []
+    try:
+        home_base: Path | None = Path.home() / ".gemini" / "antigravity-cli"
+    except RuntimeError:
+        home_base = None
+    if home_base is not None:
+        candidates.extend(home_base / name for name in _TOKEN_FILENAMES)
+    # Last resort for POSIX containers/sudo contexts where HOME does not point
     # at the account that ran `agy`. All home candidates win over any
     # /root fallback so a stale /root legacy token never beats the user's
-    # current token. Skip the extra stat when HOME already is /root.
-    if root_base != home_base:
-        candidates += [root_base / name for name in _TOKEN_FILENAMES]
+    # current token. Skip the extra stat when HOME already is /root (or on Windows).
+    if os.name != "nt":
+        root_base = Path("/root/.gemini/antigravity-cli")
+        if root_base != home_base:
+            candidates += [root_base / name for name in _TOKEN_FILENAMES]
     for candidate in candidates:
         if _is_existing_file(candidate):
             return candidate
@@ -402,8 +568,12 @@ def sync_isolated_token(isolated_home: str | Path) -> bool:
                 return True
             with contextlib.suppress(OSError):
                 isolated_token.unlink()
-        elif isolated_token.exists() and isolated_token.resolve() == Path(real_token).resolve():
-            return True  # hardlink to the same inode: always current
+        elif isolated_token.exists():
+            same_inode = False
+            with contextlib.suppress(OSError):
+                same_inode = os.path.samefile(isolated_token, real_token)
+            if same_inode:
+                return True  # hardlink to the same inode: always current
         if isolated_token.is_file():
             # An agy refresh writes a NEW file at the real path, so a copy
             # lags behind; identical bytes need no rewrite.
@@ -423,23 +593,6 @@ def sync_isolated_token(isolated_home: str | Path) -> bool:
         return False
 
 
-def _windows_credential_present() -> bool:
-    """True if agy's Windows Credential Manager entry exists.
-
-    On Windows agy stores its session in the Credential Manager
-    (target ``gemini:antigravity``) instead of an oauth token file. `cmdkey /list`
-    prints only target metadata, never the secret.
-    """
-    try:
-        # Bytes, not text: cmdkey prints in the console/OEM code page, so nothing is decoded.
-        out = subprocess.run(["cmdkey", "/list:gemini:antigravity"], capture_output=True, timeout=3, check=False,
-                             **_no_window())
-    except (OSError, subprocess.SubprocessError):  # missing cmdkey, TimeoutExpired
-        return False
-    # Fail closed on a failing cmdkey; the listed target keeps the casing it was stored with.
-    return out.returncode == 0 and b"gemini:antigravity" in (out.stdout or b"").lower()
-
-
 # Ground truth for agy's Linux credential: the reporter's sanitized live dump
 # from an active agy session (issue #1 comment, 2026-09-26, RvbbenSN), which
 # follows the zalando/go-keyring convention — label
@@ -451,6 +604,84 @@ def _windows_credential_present() -> bool:
 # fallback script, so they cannot drift apart.
 _KEYRING_SERVICE = "gemini"
 _KEYRING_USERNAME = "antigravity"
+
+_CRED_TYPE_GENERIC = 1
+_ERROR_NOT_FOUND = 1168
+_ERROR_NO_SUCH_LOGON_SESSION = 1312
+_WINDOWS_CRED_TARGET = f"{_KEYRING_SERVICE}:{_KEYRING_USERNAME}"
+
+
+def _advapi32_credential_present() -> bool | None:
+    """Check Windows Credential Manager via CredReadW without reading the secret.
+
+    Passes an opaque void pointer so CredentialBlob is never read or
+    dereferenced. Returns True on hit, False on definitive miss, or None when
+    the Win32 probe cannot answer so the caller falls back to cmdkey.
+    """
+    win_dll = getattr(ctypes, "WinDLL", None)
+    if win_dll is None:
+        return None
+    try:
+        advapi32 = win_dll("advapi32", use_last_error=True)
+        cred_read = advapi32.CredReadW
+        cred_read.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        cred_read.restype = ctypes.c_int
+        cred_free = advapi32.CredFree
+        cred_free.argtypes = [ctypes.c_void_p]
+        cred_free.restype = None
+    except (OSError, AttributeError):
+        return None
+
+    cred_ptr = ctypes.c_void_p()
+    try:
+        if cred_read(_WINDOWS_CRED_TARGET, _CRED_TYPE_GENERIC, 0, ctypes.byref(cred_ptr)):
+            return True
+        err = ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else None
+        if err in (_ERROR_NOT_FOUND, _ERROR_NO_SUCH_LOGON_SESSION):
+            return False
+        return None
+    except (OSError, AttributeError):
+        return None
+    finally:
+        if cred_ptr.value:
+            with contextlib.suppress(OSError, AttributeError):
+                cred_free(cred_ptr)
+
+
+def _cmdkey_credential_present() -> bool:
+    """Fallback CLI probe for agy's Windows Credential Manager entry."""
+    try:
+        # Bytes, not text: cmdkey prints in the console/OEM code page, so nothing is decoded.
+        out = subprocess.run(
+            ["cmdkey", f"/list:{_WINDOWS_CRED_TARGET}"],
+            capture_output=True,
+            timeout=3,
+            check=False,
+            **_no_window(),
+        )
+    except (OSError, subprocess.SubprocessError):  # missing cmdkey, TimeoutExpired
+        return False
+    # Fail closed on a failing cmdkey; the listed target keeps the casing it was stored with.
+    return out.returncode == 0 and _WINDOWS_CRED_TARGET.encode("ascii") in (out.stdout or b"").lower()
+
+
+def _windows_credential_present() -> bool:
+    """True if agy's Windows Credential Manager entry exists.
+
+    On Windows agy stores its session in the Credential Manager
+    (target ``gemini:antigravity``) instead of an oauth token file. Probes via
+    Win32 CredReadW first and falls back to ``cmdkey /list`` only when the
+    Win32 probe cannot answer.
+    """
+    verdict = _advapi32_credential_present()
+    if verdict is not None:
+        return verdict
+    return _cmdkey_credential_present()
 
 _SECRET_TOOL_BINARY = "secret-tool"
 # `search --all service <s> username <u>` ANDs the attribute pairs, so the pair
@@ -959,8 +1190,9 @@ _STRICT_BASELINE = frozenset({
     "SSL_CERT_FILE", "SSL_CERT_DIR", "SSH_AUTH_SOCK",
     # Linux keyring sign-in (agy stores its session in the freedesktop Secret Service over D-Bus)
     "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR",
-    # Windows needs these to start a process at all
+    # Windows needs these to start a process, locate AppData/UserConfigDir, and reach DPAPI/CredMan
     "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT",
+    "APPDATA", "LOCALAPPDATA", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "PROGRAMDATA",
     "AGY_CLI_DISABLE_AUTO_UPDATE", "AGY_CLI_MODEL_API_MAX_RETRIES",
 })
 
@@ -1036,21 +1268,30 @@ def build_child_env(isolated_home: Path | str) -> dict[str, str]:
     env["HOME"] = home_str
     # Windows: Go's os.UserHomeDir() reads USERPROFILE then HOMEDRIVE+HOMEPATH
     env["USERPROFILE"] = home_str
-    if "HOMEPATH" in env:
+    if os.name == "nt":
+        for k in [k for k in env if k.upper() in ("HOMEDRIVE", "HOMEPATH")]:
+            del env[k]
+        drive, tail = ntpath.splitdrive(home_str)
+        if len(drive) == 2 and drive[1] == ":":
+            env["HOMEDRIVE"] = drive
+            env["HOMEPATH"] = tail or "\\"
+    elif "HOMEPATH" in env:
         env["HOMEPATH"] = home_str
     # agy's background updater (`agy --bg-updater`) opens its own console on
     # Windows even when agy itself is hidden. An explicit parent value wins.
     env.setdefault("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
 
-    # agy 1.2.16 detects SSH sessions via SSH_CONNECTION, SSH_CLIENT, or SSH_TTY
-    # and forces file-based token storage ("Using file-based token storage because
-    # SSH session detected"). When credentials live in the OS keyring and no real
-    # token file exists, strip these variables so agy falls back to keyring auth.
-    # Preserve SSH_AUTH_SOCK so agy tools can still use ssh-agent for git over SSH.
+    # agy 1.2.16+ (and agy.exe 1.5+ on Windows) detects SSH sessions via
+    # SSH_CONNECTION, SSH_CLIENT, or SSH_TTY and forces file-based token storage
+    # ("Using file-based token storage because ... detected"). When credentials
+    # live in the OS keyring and no real token file exists, strip these
+    # variables so agy falls back to keyring auth. Preserve SSH_AUTH_SOCK so
+    # agy tools can still use ssh-agent for git over SSH.
     # See soyelmismo/hermes-antigravity-subscription#18.
-    if os.name != "nt" and resolve_real_token_path() is None:
-        for var in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
-            env.pop(var, None)
+    ssh_vars = [k for k in env if k.upper() in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")]
+    if ssh_vars and resolve_real_token_path() is None:
+        for k in ssh_vars:
+            del env[k]
 
     apply_proxy_env(env, os.getenv("ANTIGRAVITY_PROXY"))
     return env

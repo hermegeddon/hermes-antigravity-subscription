@@ -88,6 +88,24 @@ class SyncIsolatedTokenTests(unittest.TestCase):
             self.assertTrue(agy_process.sync_isolated_token(home))
         self.assertEqual(token.stat().st_ino, inode_before)
 
+    def test_hardlink_to_real_is_noop(self):
+        home = self._isolated()
+        token = home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+        try:
+            os.link(self.real_token, token)
+        except OSError as exc:
+            self.skipTest(f"hardlinks unsupported in temp dir: {exc}")
+        self.assertFalse(token.is_symlink())
+        self.assertTrue(os.path.samefile(token, self.real_token))
+        inode_before = token.stat().st_ino
+        with patch.object(agy_process, "resolve_real_token_path", return_value=self.real_token), patch.object(
+            Path, "read_bytes", side_effect=AssertionError("hardlink branch must not read or copy bytes")
+        ):
+            self.assertTrue(agy_process.sync_isolated_token(home))
+        self.assertFalse(token.is_symlink())
+        self.assertTrue(os.path.samefile(token, self.real_token))
+        self.assertEqual(token.stat().st_ino, inode_before)
+
     def test_missing_isolated_dir_created(self):
         home = Path(self.tmp.name) / "fresh-home"
         with patch.object(agy_process, "resolve_real_token_path", return_value=self.real_token):

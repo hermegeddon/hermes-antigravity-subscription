@@ -1,10 +1,11 @@
-"""Tests for build_child_env and SSH environment variable scrubbing (issue #18).
+"""Tests for build_child_env, Windows home/strict env isolation, and SSH scrubbing (issue #18).
 
-agy 1.2.16 detects SSH sessions via SSH_CONNECTION, SSH_CLIENT, or SSH_TTY and
-switches to file-based token storage ("Using file-based token storage because SSH
-session detected"). When credentials live in the OS keyring and no real token file
-exists, build_child_env must strip those variables on POSIX while leaving
-SSH_AUTH_SOCK intact and preserving parent os.environ.
+agy 1.2.16+ (and agy.exe 1.5+ on Windows) detects SSH sessions via
+SSH_CONNECTION, SSH_CLIENT, or SSH_TTY and switches to file-based token storage
+("Using file-based token storage because ... detected"). When credentials live
+in the OS keyring and no real token file exists, build_child_env must strip
+those variables while leaving SSH_AUTH_SOCK intact and preserving parent
+os.environ.
 """
 
 import os
@@ -84,10 +85,77 @@ class ChildEnvTests(unittest.TestCase):
             self.assertEqual(os.environ["SSH_TTY"], "/dev/pts/0")
             self.assertEqual(os.environ["SSH_AUTH_SOCK"], "/run/user/1000/keyring/ssh")
 
-    def test_windows_nt_does_not_strip_ssh_vars(self):
+    def test_windows_nt_splits_homedrive_and_homepath(self):
         env_sample = {
             "USERPROFILE": r"C:\Users\tester",
+            "HOMEDRIVE": "C:",
             "HOMEPATH": r"\Users\tester",
+        }
+        with patch.dict(os.environ, env_sample, clear=True):
+            with patch("process.os.name", "nt"):
+                with patch("process.resolve_real_token_path", return_value=_MOCK_TOKEN_PATH):
+                    child_env = build_child_env(r"C:\isolated\home")
+
+        self.assertEqual(child_env["HOME"], r"C:\isolated\home")
+        self.assertEqual(child_env["USERPROFILE"], r"C:\isolated\home")
+        self.assertEqual(child_env["HOMEDRIVE"], "C:")
+        self.assertEqual(child_env["HOMEPATH"], r"\isolated\home")
+
+    def test_windows_nt_overrides_cross_drive_and_mixed_case_home_vars(self):
+        # Cross-drive isolated home must replace parent HOMEDRIVE/HOMEPATH; also
+        # verify mixed-case parent keys are removed case-insensitively.
+        mixed_env = {
+            "UserProfile": r"C:\Users\tester",
+            "homedrive": "C:",
+            "HomePath": r"\Users\tester",
+        }
+        with patch("process._filtered_parent_env", return_value=dict(mixed_env)):
+            with patch("process.os.name", "nt"):
+                with patch("process.resolve_real_token_path", return_value=_MOCK_TOKEN_PATH):
+                    child_env = build_child_env(r"D:\temp\iso\home")
+
+        self.assertEqual(child_env["USERPROFILE"], r"D:\temp\iso\home")
+        self.assertEqual(child_env["HOMEDRIVE"], "D:")
+        self.assertEqual(child_env["HOMEPATH"], r"\temp\iso\home")
+        self.assertNotIn("homedrive", child_env)
+        self.assertNotIn("HomePath", child_env)
+
+    def test_windows_nt_unc_path_leaves_homedrive_and_homepath_unset(self):
+        env_sample = {
+            "USERPROFILE": r"C:\Users\tester",
+            "HOMEDRIVE": "C:",
+            "HOMEPATH": r"\Users\tester",
+        }
+        with patch.dict(os.environ, env_sample, clear=True):
+            with patch("process.os.name", "nt"):
+                with patch("process.resolve_real_token_path", return_value=_MOCK_TOKEN_PATH):
+                    child_env = build_child_env(r"\\server\share\home")
+
+        self.assertEqual(child_env["USERPROFILE"], r"\\server\share\home")
+        self.assertNotIn("HOMEDRIVE", child_env)
+        self.assertNotIn("HOMEPATH", child_env)
+
+    def test_windows_nt_no_token_file_strips_ssh_vars_case_insensitively_and_keeps_auth_sock(self):
+        mixed_env = {
+            "USERPROFILE": r"C:\Users\tester",
+            "ssh_connection": "192.168.1.50 54321 192.168.1.1 22",
+            "Ssh_Client": "192.168.1.50 54321 22",
+            "SSH_TTY": "pty1",
+            "SSH_AUTH_SOCK": r"\\.\pipe\openssh-ssh-agent",
+        }
+        with patch("process._filtered_parent_env", return_value=dict(mixed_env)):
+            with patch("process.os.name", "nt"):
+                with patch("process.resolve_real_token_path", return_value=None):
+                    child_env = build_child_env(r"C:\isolated\home")
+
+        self.assertEqual(child_env["USERPROFILE"], r"C:\isolated\home")
+        self.assertFalse(any(k.upper() in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY") for k in child_env))
+        self.assertEqual(child_env["SSH_AUTH_SOCK"], r"\\.\pipe\openssh-ssh-agent")
+
+    def test_windows_nt_with_token_file_preserves_all_ssh_vars(self):
+        token_path = Path(r"C:\Users\tester\.gemini\antigravity-cli\jetski-standalone-oauth-token")
+        env_sample = {
+            "USERPROFILE": r"C:\Users\tester",
             "SSH_CONNECTION": "192.168.1.50 54321 192.168.1.1 22",
             "SSH_CLIENT": "192.168.1.50 54321 22",
             "SSH_TTY": "pty1",
@@ -95,15 +163,42 @@ class ChildEnvTests(unittest.TestCase):
         }
         with patch.dict(os.environ, env_sample, clear=True):
             with patch("process.os.name", "nt"):
-                with patch("process.resolve_real_token_path", return_value=None):
+                with patch("process.resolve_real_token_path", return_value=token_path):
                     child_env = build_child_env(r"C:\isolated\home")
 
-        self.assertEqual(child_env["USERPROFILE"], r"C:\isolated\home")
-        self.assertEqual(child_env["HOMEPATH"], r"C:\isolated\home")
-        self.assertIn("SSH_CONNECTION", child_env)
-        self.assertIn("SSH_CLIENT", child_env)
-        self.assertIn("SSH_TTY", child_env)
-        self.assertIn("SSH_AUTH_SOCK", child_env)
+        self.assertEqual(child_env["SSH_CONNECTION"], "192.168.1.50 54321 192.168.1.1 22")
+        self.assertEqual(child_env["SSH_CLIENT"], "192.168.1.50 54321 22")
+        self.assertEqual(child_env["SSH_TTY"], "pty1")
+        self.assertEqual(child_env["SSH_AUTH_SOCK"], r"\\.\pipe\openssh-ssh-agent")
+
+    def test_windows_strict_mode_retains_appdata_and_sets_isolated_home(self):
+        env_sample = {
+            "ANTIGRAVITY_ENV_STRICT": "1",
+            "PATH": r"C:\Windows\System32",
+            "SYSTEMROOT": r"C:\Windows",
+            "APPDATA": r"C:\Users\tester\AppData\Roaming",
+            "LOCALAPPDATA": r"C:\Users\tester\AppData\Local",
+            "PROGRAMDATA": r"C:\ProgramData",
+            "USERPROFILE": r"C:\Users\tester",
+            "HOMEDRIVE": "C:",
+            "HOMEPATH": r"\Users\tester",
+            "OPENAI_API_KEY": "sk-secret",
+            "UNLISTED_VAR": "drop-me",
+        }
+        with patch.dict(os.environ, env_sample, clear=True):
+            with patch("process.os.name", "nt"):
+                with patch("process.resolve_real_token_path", return_value=None):
+                    child_env = build_child_env(r"D:\isolated\home")
+
+        self.assertEqual(child_env["APPDATA"], r"C:\Users\tester\AppData\Roaming")
+        self.assertEqual(child_env["LOCALAPPDATA"], r"C:\Users\tester\AppData\Local")
+        self.assertEqual(child_env["PROGRAMDATA"], r"C:\ProgramData")
+        self.assertEqual(child_env["SYSTEMROOT"], r"C:\Windows")
+        self.assertEqual(child_env["USERPROFILE"], r"D:\isolated\home")
+        self.assertEqual(child_env["HOMEDRIVE"], "D:")
+        self.assertEqual(child_env["HOMEPATH"], r"\isolated\home")
+        self.assertNotIn("OPENAI_API_KEY", child_env)
+        self.assertNotIn("UNLISTED_VAR", child_env)
 
 
 class ChildEnvSecretScrubbingTests(unittest.TestCase):

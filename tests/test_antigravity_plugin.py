@@ -233,7 +233,8 @@ class AntigravityPluginTests(unittest.TestCase):
                 for ctx in self._windows_without_token_file(home):
                     stack.enter_context(ctx)
                 kwargs = {"side_effect": result} if isinstance(result, Exception) else {"return_value": result}
-                with patch("process.subprocess.run", **kwargs) as run:
+                with patch("process._advapi32_credential_present", return_value=None), \
+                        patch("process.subprocess.run", **kwargs) as run:
                     self.assertIs(is_authenticated(), expected)
                     self.assertEqual(run.call_args.args[0], ["cmdkey", "/list:gemini:antigravity"])
                     call = run.call_args.kwargs
@@ -252,9 +253,11 @@ class AntigravityPluginTests(unittest.TestCase):
             # real os module) so pathlib's global os.name check keeps working.
             with patch.dict(os.environ, {"ANTIGRAVITY_CONFIG_DIR": tmp}, clear=False), \
                     patch("process.os", wraps=os) as mock_os, \
+                    patch("process._advapi32_credential_present", return_value=True) as adv, \
                     patch("process.subprocess.run", return_value=listed) as run:
                 mock_os.name = "nt"
                 self.assertFalse(is_authenticated())
+                adv.assert_not_called()
                 run.assert_not_called()
 
     def test_format_messages_prompt(self):
