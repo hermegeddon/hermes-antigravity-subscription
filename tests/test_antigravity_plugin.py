@@ -818,9 +818,9 @@ class AntigravityPluginTests(unittest.TestCase):
             },
         )
 
-    def test_parse_catalog_folds_xhigh_duplicate_into_high_effort(self):
-        # Issue #47: `agy models` lists gemini-4-hydrogen-xhigh as a lesser
-        # duplicate of the real gemini-4-hydrogen-{low,medium,high} variants.
+    def test_parse_catalog_folds_xhigh_into_base_model_efforts(self):
+        # `agy models` lists `-xhigh` for selective models (issue #47 / agy 1.5+):
+        # it must group into its base model rather than surfacing as a separate bare entry.
         import models
 
         raw_output = (
@@ -831,16 +831,16 @@ class AntigravityPluginTests(unittest.TestCase):
             "gemini-4-hydrogen-xhigh\tGemini 4 Hydrogen (XHigh)\n"
         )
         catalog = models.parse_catalog(raw_output)
-        self.assertEqual(catalog, {"gemini-4-hydrogen": ("low", "medium", "high")})
-        # The bogus bare-name duplicate must not surface in list_models().
+        self.assertEqual(catalog, {"gemini-4-hydrogen": ("low", "medium", "high", "xhigh")})
+        # The suffixed entry must not surface in list_models().
         self.assertNotIn("gemini-4-hydrogen-xhigh", catalog)
 
-    def test_split_effort_suffix_xhigh_normalizes_to_high(self):
+    def test_split_effort_suffix_xhigh_preserves_native_level(self):
         import models
 
         self.assertEqual(
             models.split_effort_suffix("gemini-4-hydrogen-xhigh"),
-            ("gemini-4-hydrogen", "high"),
+            ("gemini-4-hydrogen", "xhigh"),
         )
         # Non-suffixed and real-effort ids keep their existing behavior.
         self.assertEqual(
@@ -852,7 +852,7 @@ class AntigravityPluginTests(unittest.TestCase):
             ("gemini-4-hydrogen", None),
         )
 
-    def test_resolve_model_and_effort_xhigh_request_resolves_to_high(self):
+    def test_resolve_model_and_effort_xhigh_native_and_clamped(self):
         import time as _time
 
         import models
@@ -864,6 +864,15 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertEqual(
             models.resolve_model_and_effort("gemini-4-hydrogen-xhigh"),
             ("gemini-4-hydrogen-high", "high"),
+        )
+
+        models._catalog_cache = (
+            _time.monotonic() + 60.0,
+            {"gemini-4-hydrogen": ("low", "medium", "high", "xhigh")},
+        )
+        self.assertEqual(
+            models.resolve_model_and_effort("gemini-4-hydrogen-xhigh"),
+            ("gemini-4-hydrogen-xhigh", "xhigh"),
         )
 
     def test_dynamic_alias_precedence_with_claude_5_5(self):

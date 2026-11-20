@@ -29,10 +29,10 @@ _KNOWN_EFFORTS: dict[str, tuple[str, ...]] = {
     "claude-sonnet-4-6": (),
     "claude-opus-4-6-thinking": (),
     "gpt-oss-120b": ("medium",),
-    "gemini-4-neon": ("low", "medium", "high"),
+    "gemini-4-neon": ("low", "medium", "high", "xhigh"),
     "gemini-4-carbon": ("low", "medium", "high"),
     "gemini-4-argon": ("low", "medium", "high"),
-    "gemini-4-hydrogen": ("low", "medium", "high"),
+    "gemini-4-hydrogen": ("low", "medium", "high", "xhigh"),
     "gemini-pro-orchestrator": (),
     "gemini-pro-orchestrator-neon": (),
     "gemini-pro-orchestrator-argon": (),
@@ -64,17 +64,19 @@ _MODEL_ALIASES = {
 }
 
 # Effort suffixes agy appends to a base model id, or that callers use as
-# effort aliases. `-xhigh` (issue #47 duplicate listing on several models)
-# and `-max` normalize into the base model's `high` variant, matching
-# `_normalize_effort`.
+# effort aliases. `-xhigh` maps to the `xhigh` effort level for models that
+# advertise it (e.g. `gemini-4-neon`, `gemini-4-hydrogen`), and clamps to
+# `high` via `_nearest_effort` on models limited to `low`/`medium`/`high`.
+# `-max` normalizes to `high` so a hypothetical `<base>-max` listing never
+# claims `xhigh` support (`agy` rejects `--effort max` on all models).
 _EFFORT_SUFFIXES = (
-    ("-xhigh", "high"),
+    ("-xhigh", "xhigh"),
     ("-max", "high"),
     ("-high", "high"),
     ("-medium", "medium"),
     ("-low", "low"),
 )
-_EFFORT_RANK = {"low": 0, "medium": 1, "high": 2}
+_EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3}
 
 _SPINNER_CHARS = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _SKIP_LINE_PREFIXES = ("error:", "usage:", "available models:", "warning:", "--")
@@ -92,7 +94,7 @@ def _normalize_effort(effort: str | None) -> str | None:
     if e in ("none", "off", "minimal"):
         return "low"
     if e in ("xhigh", "max", "ultra"):
-        return "high"
+        return "xhigh"
     if e in ("low", "medium", "high"):
         return e
     return "medium"
@@ -101,10 +103,9 @@ def _normalize_effort(effort: str | None) -> str | None:
 def split_effort_suffix(model: str) -> tuple[str, str | None]:
     """Split `gemini-3.8-flash-high` into (`gemini-3.8-flash`, `high`).
 
-    A trailing `-xhigh` splits as an effort alias for `high` (issue #47):
-    agy lists `gemini-4-hydrogen-xhigh` as a lesser duplicate of the real
-    `gemini-4-hydrogen-{low,medium,high}` variants, and it must group into
-    the base model instead of surfacing as a separate bare-name model.
+    A trailing `-xhigh` splits as `"xhigh"` so `-xhigh` variants group into
+    their base model instead of surfacing as separate bare-name entries, while
+    models without `"xhigh"` clamp cleanly to `"high"` during resolution.
     """
     for suffix, effort in _EFFORT_SUFFIXES:
         if model.endswith(suffix):
@@ -116,9 +117,8 @@ def parse_catalog(text: str) -> dict[str, tuple[str, ...]]:
     """Group `agy models` output as {base model: supported efforts}.
 
     `gemini-3.8-flash-{low,medium,high}` becomes one `gemini-3.8-flash` entry
-    with three efforts; an id with no effort suffix maps to an empty tuple.
-    A trailing `-xhigh` groups into its base as the `high` effort (issue #47),
-    so `gemini-4-hydrogen-xhigh` never surfaces as a separate bare-name model.
+    with three efforts; models listing `-xhigh` (e.g. `gemini-4-neon`) keep
+    `"xhigh"` in their supported tuple, and bare ids map to an empty tuple.
     Insertion order follows the order agy printed the models in.
     """
     grouped: dict[str, list[str]] = {}
@@ -276,9 +276,10 @@ def _apply_suffix_if_supported(
     suffix: str | None,
     catalog: dict[str, tuple[str, ...]],
 ) -> str:
-    """Append `-<suffix>` only when `catalog` defines effort levels for `target`."""
-    if suffix and catalog.get(target):
-        return f"{target}-{suffix}"
+    """Append `-<effort>` clamped to `target`'s supported efforts in `catalog`."""
+    supported = catalog.get(target)
+    if suffix and supported:
+        return f"{target}-{_nearest_effort(suffix, supported)}"
     return target
 
 

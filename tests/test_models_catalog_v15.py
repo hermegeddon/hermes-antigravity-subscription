@@ -58,14 +58,14 @@ class ModelsCatalogV15Tests(unittest.TestCase):
     def _pin_catalog(self, catalog: dict[str, tuple[str, ...]]):
         return patch("models._catalog_cache", (time.monotonic() + 60.0, catalog))
 
-    def test_parse_catalog_folds_xhigh_and_max_and_keeps_orchestrators_bare(self):
+    def test_parse_catalog_preserves_selective_xhigh_and_keeps_orchestrators_bare(self):
         self.assertEqual(
             self.catalog,
             {
-                "gemini-4-neon": ("low", "medium", "high"),
+                "gemini-4-neon": ("low", "medium", "high", "xhigh"),
                 "gemini-4-carbon": ("low", "medium", "high"),
                 "gemini-4-argon": ("low", "medium", "high"),
-                "gemini-4-hydrogen": ("low", "medium", "high"),
+                "gemini-4-hydrogen": ("low", "medium", "high", "xhigh"),
                 "gemini-pro-orchestrator-neon": (),
                 "gemini-pro-orchestrator": (),
                 "gemini-pro-orchestrator-argon": (),
@@ -201,28 +201,38 @@ class ModelsCatalogV15Tests(unittest.TestCase):
                 ("gemini-4-neon-medium", "medium"),
             )
 
-    def test_max_and_xhigh_folding_and_effort_resolution(self):
+    def test_selective_native_xhigh_and_clamping(self):
         self.assertEqual(models.split_effort_suffix("claude-opus-5-5-max"), ("claude-opus-5-5", "high"))
-        self.assertEqual(models.split_effort_suffix("gemini-4-neon-xhigh"), ("gemini-4-neon", "high"))
+        self.assertEqual(models.split_effort_suffix("gemini-4-neon-xhigh"), ("gemini-4-neon", "xhigh"))
         self.assertEqual(models.resolve_model_alias("claude-opus-5-5-max", self.catalog), "claude-opus-5-5-high")
-        self.assertEqual(models.resolve_model_alias("gemini-4-neon-xhigh", self.catalog), "gemini-4-neon-high")
+        self.assertEqual(models.resolve_model_alias("gemini-4-neon-xhigh", self.catalog), "gemini-4-neon-xhigh")
+        self.assertEqual(models.resolve_model_alias("neon-xhigh", self.catalog), "gemini-4-neon-xhigh")
+        self.assertEqual(models.resolve_model_alias("argon-xhigh", self.catalog), "gemini-4-argon-high")
         self.assertEqual(models.resolve_model_alias("opus-max", self.catalog), "claude-opus-5-5-high")
 
         with self._pin_catalog(self.catalog):
+            # Native xhigh models accept xhigh directly (and map max/ultra -> xhigh)
+            self.assertEqual(models.resolve_model_and_effort("gemini-4-neon", "xhigh"), ("gemini-4-neon-xhigh", "xhigh"))
+            self.assertEqual(models.resolve_model_and_effort("gemini-4-neon-xhigh"), ("gemini-4-neon-xhigh", "xhigh"))
+            self.assertEqual(models.resolve_model_and_effort("gemini-4-neon", "max"), ("gemini-4-neon-xhigh", "xhigh"))
+            self.assertEqual(models.resolve_model_and_effort("gemini-4-hydrogen", "xhigh"), ("gemini-4-hydrogen-xhigh", "xhigh"))
+            # Models limited to low/medium/high clamp xhigh and max down to high
+            self.assertEqual(models.resolve_model_and_effort("gemini-4-argon", "xhigh"), ("gemini-4-argon-high", "high"))
+            self.assertEqual(models.resolve_model_and_effort("gemini-4-carbon", "xhigh"), ("gemini-4-carbon-high", "high"))
             self.assertEqual(models.resolve_model_and_effort("claude-opus-5-5-max"), ("claude-opus-5-5-high", "high"))
+            self.assertEqual(models.resolve_model_and_effort("claude-opus-5-5", "xhigh"), ("claude-opus-5-5-high", "high"))
             self.assertEqual(models.resolve_model_and_effort("claude-opus-5-5", "max"), ("claude-opus-5-5-high", "high"))
-            self.assertEqual(models.resolve_model_and_effort("gemini-4-neon-xhigh"), ("gemini-4-neon-high", "high"))
-            self.assertEqual(models.resolve_model_and_effort("gemini-4-neon", "xhigh"), ("gemini-4-neon-high", "high"))
 
     def test_profile_supported_reasoning_efforts_on_v15_catalog(self):
         profile = get_provider_profile("antigravity-subscription-directsdk")
         prov_models = sys.modules.get(f"{type(profile).__module__}.models", models)
         with patch.object(prov_models, "_catalog_cache", (time.monotonic() + 60.0, self.catalog)), \
                 patch("models._catalog_cache", (time.monotonic() + 60.0, self.catalog)):
-            self.assertEqual(profile.supported_reasoning_efforts("pro"), ("low", "medium", "high"))
+            self.assertEqual(profile.supported_reasoning_efforts("pro"), ("low", "medium", "high", "xhigh"))
             self.assertEqual(profile.supported_reasoning_efforts("orchestrator"), ())
             self.assertEqual(profile.supported_reasoning_efforts("gemini-pro-orchestrator-neon"), ())
-            self.assertEqual(profile.supported_reasoning_efforts("gemini-4-neon"), ("low", "medium", "high"))
+            self.assertEqual(profile.supported_reasoning_efforts("gemini-4-neon"), ("low", "medium", "high", "xhigh"))
+            self.assertEqual(profile.supported_reasoning_efforts("gemini-4-argon"), ("low", "medium", "high"))
             self.assertEqual(profile.supported_reasoning_efforts("claude-opus-5-5-max"), ("low", "medium", "high"))
 
         with patch.object(prov_models, "_catalog_cache", None), \
