@@ -153,7 +153,7 @@ The plugin also declares vision capability to Hermes' image router (`agent/model
 Every client runs `agy` with an isolated `HOME` inside a temp dir (`hermes_agy_*`); the user's real `~/.gemini` sessions, conversation index and brain are never touched. Cleanup layers:
 
 1. `close()` kills the worker and removes the temp dir plus any materialized media files.
-2. A Linux `/proc` sweep on client init (`reap_orphaned_plugin_workers`) terminates leftover plugin workers whose owning temp dir was already deleted — a Hermes process that dies without `close()` would otherwise leave an orphaned worker (PPID 1) holding a conversation open on the account; a 17-hour orphan was observed tangling other sessions' turns (2026-11-11).
+2. On client init, `reap_orphaned_plugin_workers()` sweeps leftover workers whose owner died without `close()` — inspecting `/proc` on Linux (for stream-json workers whose `HOME` tempdir is gone) and creation-timestamp-verified `.hermes_owner.json` stamps under `hermes_agy_*` on Windows (complemented by a kill-on-close Job Object on Windows and `PR_SET_PDEATHSIG` on Linux) — reclaiming both orphaned worker processes and their tempdirs.
 3. Leftover temp dirs under Hermes' scratch are pruned by the normal 24h idle sweep.
 
 Hermes Stop calls the client's `cancel()` hook to terminate its worker and concurrent

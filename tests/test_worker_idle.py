@@ -7,6 +7,7 @@ finished a turn for ``ANTIGRAVITY_WORKER_IDLE_SECONDS`` (default 900).
 """
 
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -23,9 +24,11 @@ from client import (
     _DEFAULT_TIMEOUT_SECONDS,
     _DEFAULT_WORKER_IDLE_SECONDS,
     _worker_abandon_seconds,
+    _worker_cpu_seconds,
     _worker_idle_seconds,
     AntigravityClient,
 )
+from process import _no_window, terminate_process
 
 TURN_MESSAGES = [{"role": "user", "content": "hello agy"}]
 IDLE_ENV = "ANTIGRAVITY_WORKER_IDLE_SECONDS"
@@ -320,6 +323,47 @@ class WorkerIdleTests(unittest.TestCase):
         with patch.dict(os.environ, {IDLE_ENV: "1"}):
             os.environ.pop(ABANDON_ENV, None)
             self.assertGreaterEqual(_worker_abandon_seconds(), _DEFAULT_TIMEOUT_SECONDS)
+
+
+class WindowsCpuMeasurementTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows GetProcessTimes")
+    def test_worker_cpu_seconds_measures_live_windows_subprocess(self):
+        # On Windows venvs/uv, sys.executable can be a thin launcher shim that
+        # spawns and waits on _base_executable; spawn the real interpreter.
+        python_exe = getattr(sys, "_base_executable", None) or sys.executable
+        burn_script = (
+            "import time\n"
+            "deadline = time.process_time() + 0.2\n"
+            "x = 0\n"
+            "while time.process_time() < deadline:\n"
+            "    x += 1\n"
+            "print('burned', x, flush=True)\n"
+            "time.sleep(10)\n"
+        )
+        proc = subprocess.Popen(
+            [python_exe, "-c", burn_script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            **_no_window(),
+        )
+        self.addCleanup(lambda: terminate_process(proc) if proc.poll() is None else None)
+
+        initial = _worker_cpu_seconds(proc)
+        self.assertIsNotNone(initial)
+        line = proc.stdout.readline().strip()
+        self.assertTrue(line.startswith("burned "), f"unexpected child output: {line!r}")
+
+        after_burn = _worker_cpu_seconds(proc)
+        self.assertIsNotNone(after_burn)
+        self.assertGreater(after_burn, 0.05)
+        self.assertGreaterEqual(after_burn, initial)
+
+        # Exited subprocesses and MagicMocks return None cleanly.
+        terminate_process(proc)
+        proc.wait(timeout=5)
+        self.assertIsNone(_worker_cpu_seconds(proc))
+        self.assertIsNone(_worker_cpu_seconds(MagicMock(pid=None)))
 
 
 if __name__ == "__main__":

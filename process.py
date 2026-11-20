@@ -13,6 +13,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 from collections import deque
 from pathlib import Path
@@ -1010,22 +1011,152 @@ def is_authenticated() -> bool:
         return False
 
 
-def reap_orphaned_plugin_workers() -> int:
-    """Kill agy workers whose isolated home was already deleted.
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_STILL_ACTIVE = 259
+_OWNER_STAMP_FILENAME = ".hermes_owner.json"
 
-    A Hermes process that dies without close() leaves its agy worker
-    orphaned (PPID=1) holding a conversation open on the shared account;
-    its stream turns then tangle with every NEW session's turns (observed
-    2026-11-11). The owning client's TemporaryDirectory is removed on
-    clean close, so a worker whose HOME points into a nonexistent
-    ``hermes_agy_*`` directory has no owner left. Scoped hard: the
-    cmdline must carry the plugin's stream-json signature AND the env
-    HOME must sit inside a deleted hermes_agy_* tempdir — the user's own
-    interactive agy (HOME=/root) and other sessions' live workers are
-    never touched. Linux-only (/proc); returns the number reaped.
-    """
-    if not sys.platform.startswith("linux"):
-        return 0
+
+class _FileTime(ctypes.Structure):
+    _fields_ = [
+        ("dwLowDateTime", ctypes.c_uint32),
+        ("dwHighDateTime", ctypes.c_uint32),
+    ]
+
+
+def _filetime_to_100ns(ft: _FileTime) -> int:
+    return (int(ft.dwHighDateTime) << 32) | int(ft.dwLowDateTime)
+
+
+def _bind_process_time_kernel32() -> Any | None:
+    win_dll = getattr(ctypes, "WinDLL", None)
+    if win_dll is None:
+        return None
+    kernel32 = win_dll("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    kernel32.GetProcessTimes.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_FileTime),
+        ctypes.POINTER(_FileTime),
+        ctypes.POINTER(_FileTime),
+        ctypes.POINTER(_FileTime),
+    ]
+    kernel32.GetProcessTimes.restype = ctypes.c_int
+    return kernel32
+
+
+def _query_handle_times_100ns(kernel32: Any, handle: int) -> tuple[int, int] | None:
+    exit_code = ctypes.c_uint32()
+    if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+        return None
+    if exit_code.value != _STILL_ACTIVE:
+        return None
+    creation = _FileTime()
+    exit_time = _FileTime()
+    kernel = _FileTime()
+    user = _FileTime()
+    if not kernel32.GetProcessTimes(
+        handle,
+        ctypes.byref(creation),
+        ctypes.byref(exit_time),
+        ctypes.byref(kernel),
+        ctypes.byref(user),
+    ):
+        return None
+    return _filetime_to_100ns(creation), _filetime_to_100ns(kernel) + _filetime_to_100ns(user)
+
+
+def get_process_times_100ns(pid_or_proc: Any) -> tuple[int, int] | None:
+    """Return ``(creation_100ns, kernel_plus_user_100ns)`` for a live Windows process."""
+    if os.name != "nt":
+        return None
+    try:
+        kernel32 = _bind_process_time_kernel32()
+    except (OSError, AttributeError):
+        return None
+    if kernel32 is None:
+        return None
+
+    if isinstance(pid_or_proc, _REAL_POPEN_TYPE):
+        if pid_or_proc.poll() is not None:
+            return None
+        raw_handle = getattr(pid_or_proc, "_handle", None)
+        if not isinstance(raw_handle, int) or isinstance(raw_handle, bool) or raw_handle <= 0:
+            return None
+        with contextlib.suppress(OSError, ValueError):
+            return _query_handle_times_100ns(kernel32, int(raw_handle))
+        return None
+
+    if not isinstance(pid_or_proc, int) or isinstance(pid_or_proc, bool) or pid_or_proc <= 0:
+        return None
+
+    try:
+        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, 0, pid_or_proc)
+    except (OSError, ValueError):
+        return None
+    if not handle:
+        return None
+    try:
+        return _query_handle_times_100ns(kernel32, int(handle))
+    except (OSError, ValueError):
+        return None
+    finally:
+        with contextlib.suppress(OSError):
+            kernel32.CloseHandle(handle)
+
+
+def _owner_stamp_path(cwd: Path | str) -> Path | None:
+    """Path to ``.hermes_owner.json`` inside a Windows ``hermes_agy_*`` workspace."""
+    if os.name != "nt":
+        return None
+    path = Path(cwd)
+    if not path.name.startswith("hermes_agy_"):
+        return None
+    return path / _OWNER_STAMP_FILENAME
+
+
+def _write_owner_stamp(stamp_path: Path, payload: dict[str, Any]) -> None:
+    tmp_path = stamp_path.with_suffix(".json.tmp")
+    with contextlib.suppress(OSError):
+        tmp_path.write_text(_json.dumps(payload), encoding="utf-8")
+        os.replace(tmp_path, stamp_path)
+
+
+def _read_owner_stamp(stamp_path: Path) -> dict[str, Any] | None:
+    try:
+        data = _json.loads(stamp_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def record_isolated_worker_pid(cwd: Path | str, proc: subprocess.Popen) -> None:
+    """Record a spawned Windows worker PID and creation timestamp in ``.hermes_owner.json``."""
+    if os.name != "nt" or not isinstance(proc, _REAL_POPEN_TYPE):
+        return
+    stamp_path = _owner_stamp_path(cwd)
+    if stamp_path is None:
+        return
+    with contextlib.suppress(Exception):
+        stamp = _read_owner_stamp(stamp_path) or {}
+        if not isinstance(stamp.get("owner_pid"), int) or not isinstance(
+            stamp.get("owner_creation_100ns"), int
+        ):
+            owner_times = get_process_times_100ns(os.getpid())
+            stamp["owner_pid"] = os.getpid()
+            stamp["owner_creation_100ns"] = owner_times[0] if owner_times else None
+        worker_times = get_process_times_100ns(proc) or get_process_times_100ns(proc.pid)
+        stamp["worker_pid"] = proc.pid
+        stamp["worker_creation_100ns"] = worker_times[0] if worker_times else None
+        _write_owner_stamp(stamp_path, stamp)
+
+
+def _reap_linux_orphaned_workers() -> int:
+    """Kill orphaned stream-json workers on Linux via /proc whose tempdir is gone."""
     reaped = 0
     try:
         entries = os.listdir("/proc")
@@ -1072,11 +1203,98 @@ def reap_orphaned_plugin_workers() -> int:
     return reaped
 
 
+def _is_valid_pid(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _reap_windows_orphaned_workers() -> int:
+    """Reap orphaned Windows worker trees and tempdirs using ``.hermes_owner.json``."""
+    reaped = 0
+    try:
+        candidates = list(Path(tempfile.gettempdir()).glob("hermes_agy_*"))
+    except OSError:
+        return 0
+    for entry in candidates:
+        try:
+            if not entry.is_dir():
+                continue
+            stamp = _read_owner_stamp(entry / _OWNER_STAMP_FILENAME)
+            if stamp is None:
+                continue
+            owner_pid = stamp.get("owner_pid")
+            owner_creation = stamp.get("owner_creation_100ns")
+            if (
+                not _is_valid_pid(owner_pid)
+                or not isinstance(owner_creation, int)
+                or isinstance(owner_creation, bool)
+            ):
+                continue
+            # Confirm owner identity by creation timestamp so OS PID reuse cannot mask death.
+            owner_times = get_process_times_100ns(owner_pid)
+            if owner_times is not None and owner_times[0] == owner_creation:
+                continue
+
+            worker_pid = stamp.get("worker_pid")
+            worker_creation = stamp.get("worker_creation_100ns")
+            if (
+                _is_valid_pid(worker_pid)
+                and isinstance(worker_creation, int)
+                and not isinstance(worker_creation, bool)
+            ):
+                worker_times = get_process_times_100ns(worker_pid)
+                if worker_times is not None and worker_times[0] == worker_creation:
+                    logger.warning(
+                        "Reaping orphaned Windows agy worker pid=%d (owner pid=%d is gone).",
+                        worker_pid,
+                        owner_pid,
+                    )
+                    with contextlib.suppress(Exception):
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(worker_pid)],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=False,
+                            **_no_window(),
+                        )
+                    reaped += 1
+            shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            continue
+    return reaped
+
+
+def reap_orphaned_plugin_workers() -> int:
+    """Kill agy workers whose owning client died without closing.
+
+    On Linux, inspects ``/proc`` for stream-json workers whose ``HOME`` sits
+    inside a deleted ``hermes_agy_*`` tempdir. On Windows, inspects
+    ``hermes_agy_*`` tempdirs carrying a creation-timestamp-verified
+    ``.hermes_owner.json`` stamp, kills any surviving worker whose owner is
+    gone, and reclaims the orphaned tempdir. Returns the number reaped.
+    """
+    if sys.platform.startswith("linux"):
+        return _reap_linux_orphaned_workers()
+    if os.name == "nt":
+        return _reap_windows_orphaned_workers()
+    return 0
+
+
 def setup_isolated_home(cwd: Path | str) -> tuple[Path, Path]:
     """Create isolated HOME inside cwd and link authentic oauth token."""
     isolated_home = Path(cwd) / "home"
     isolated_gemini_dir = isolated_home / ".gemini" / "antigravity-cli"
     isolated_gemini_dir.mkdir(parents=True, exist_ok=True)
+    if (stamp_path := _owner_stamp_path(cwd)) is not None and not stamp_path.exists():
+        owner_times = get_process_times_100ns(os.getpid())
+        _write_owner_stamp(
+            stamp_path,
+            {
+                "owner_pid": os.getpid(),
+                "owner_creation_100ns": owner_times[0] if owner_times else None,
+                "worker_pid": None,
+                "worker_creation_100ns": None,
+            },
+        )
 
     real_token = resolve_real_token_path()
     if real_token and _is_existing_file(real_token):

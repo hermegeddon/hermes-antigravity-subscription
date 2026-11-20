@@ -41,9 +41,11 @@ try:
         _kill_process_tree,
         _own_process_group,
         build_child_env,
+        get_process_times_100ns,
         is_authenticated,
         read_media_rules,
         reap_orphaned_plugin_workers,
+        record_isolated_worker_pid,
         register_tracked_process,
         resolve_agy_command,
         resolve_real_token_path,
@@ -83,9 +85,11 @@ except ImportError:
         _kill_process_tree,
         _own_process_group,
         build_child_env,
+        get_process_times_100ns,
         is_authenticated,
         read_media_rules,
         reap_orphaned_plugin_workers,
+        record_isolated_worker_pid,
         register_tracked_process,
         resolve_agy_command,
         resolve_real_token_path,
@@ -193,12 +197,17 @@ _WORKER_ABANDON_CPU_SECONDS = 1.0
 def _worker_cpu_seconds(proc: subprocess.Popen) -> float | None:
     """Total CPU seconds the worker has consumed, or None when unreadable.
 
-    Linux only: /proc/<pid>/stat carries utime and stime as fields 14 and 15,
-    measured from *after* the comm field, which is parenthesised and may itself
-    contain spaces and parentheses -- hence the split on the last ')'.
+    On Windows, uses ``GetProcessTimes`` (kernel + user 100 ns intervals).
+    On Linux, reads utime and stime from ``/proc/<pid>/stat`` after the
+    parenthesized ``comm`` field (which may itself contain spaces or ``)``).
     """
     pid = getattr(proc, "pid", None)
-    if not pid or not os.path.isdir("/proc"):
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    if os.name == "nt":
+        times = get_process_times_100ns(proc)
+        return times[1] / 10_000_000.0 if times is not None else None
+    if not os.path.isdir("/proc"):
         return None
     try:
         with open(f"/proc/{pid}/stat", "rb") as handle:
@@ -907,6 +916,7 @@ class AntigravityClient:
             self._worker_usage_baseline = {}
             self._active_processes.add(proc)
             register_tracked_process(proc)
+            record_isolated_worker_pid(self._cwd, proc)
             self._worker_last_activity[proc] = time.monotonic()
             # Give every worker a death date at spawn, not only when a turn
             # finishes. The countdown was armed solely by
