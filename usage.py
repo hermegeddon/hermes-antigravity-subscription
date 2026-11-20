@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import subprocess
@@ -39,10 +40,22 @@ else:
 
 try:
     from .client import _force_rmtree
-    from .process import _no_window, build_child_env, resolve_agy_command, setup_isolated_home
+    from .process import (
+        _no_window,
+        build_child_env,
+        reap_orphaned_plugin_workers,
+        resolve_agy_command,
+        setup_isolated_home,
+    )
 except ImportError:
     from client import _force_rmtree
-    from process import _no_window, build_child_env, resolve_agy_command, setup_isolated_home
+    from process import (
+        _no_window,
+        build_child_env,
+        reap_orphaned_plugin_workers,
+        resolve_agy_command,
+        setup_isolated_home,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +264,7 @@ def _query_agy_usage(timeout: float = 8.0) -> SubscriptionUsage | None:
     """Run `agy -p "/usage" --output-format json` under an isolated HOME environment."""
     cmd = resolve_agy_command()
     tmp_dir = tempfile.mkdtemp(prefix="hermes_agy_usage_")
+    timed_out = False
     try:
         isolated_home, _ = setup_isolated_home(tmp_dir)
         env = build_child_env(isolated_home)
@@ -260,6 +274,8 @@ def _query_agy_usage(timeout: float = 8.0) -> SubscriptionUsage | None:
             cwd=tmp_dir,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             **_no_window(),
         )
@@ -267,14 +283,15 @@ def _query_agy_usage(timeout: float = 8.0) -> SubscriptionUsage | None:
             logger.warning(
                 "Antigravity usage process returned non-zero (%d): %s",
                 res.returncode,
-                res.stderr.strip() or res.stdout.strip(),
+                (res.stderr or "").strip() or (res.stdout or "").strip(),
             )
             return None
-        return parse_agy_usage(res.stdout)
+        return parse_agy_usage(res.stdout or "")
     except FileNotFoundError:
         logger.warning("Antigravity binary not found: %s", cmd)
         return None
     except subprocess.TimeoutExpired:
+        timed_out = True
         logger.warning("Antigravity usage query timed out after %.1fs", timeout)
         return None
     except Exception as exc:
@@ -282,6 +299,10 @@ def _query_agy_usage(timeout: float = 8.0) -> SubscriptionUsage | None:
         return None
     finally:
         _force_rmtree(tmp_dir)
+        if timed_out:
+            # Delete tmp_dir first so the reaper identifies any surviving child as orphaned.
+            with contextlib.suppress(Exception):
+                reap_orphaned_plugin_workers()
 
 
 def fetch_subscription_usage(
