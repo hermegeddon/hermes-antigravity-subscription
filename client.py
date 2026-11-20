@@ -1052,15 +1052,23 @@ class AntigravityClient:
             messages_list, self._materialized_media
         )
 
-        worker_acquired = self._worker_lock.acquire(blocking=False)
-        if worker_acquired:
-            try:
-                self._ensure_worker_media_permissions(turn_media_paths, worker_turn=True)
-            except Exception:
-                # Permission setup precedes worker I/O. A settings failure must
-                # release our turn without discarding a healthy conversation.
-                self._worker_lock.release()
-                raise
+        if not self._worker_lock.acquire(blocking=False):
+            self._ensure_worker_media_permissions(turn_media_paths, worker_turn=False)
+            return self._run_oneshot_completion(
+                model=resolved_model,
+                effort=effort,
+                messages=messages_list,
+                timeout=effective_timeout,
+                tools=tools,
+                tool_choice=tool_choice,
+                stream=stream,
+            )
+
+        owns_worker_lock = True
+        try:
+            # Permission setup precedes worker I/O: a settings failure must
+            # release our turn lock without discarding a healthy conversation.
+            self._ensure_worker_media_permissions(turn_media_paths, worker_turn=True)
             try:
                 with self._lock:
                     ref_history = (
@@ -1116,6 +1124,7 @@ class AntigravityClient:
                 except (BrokenPipeError, OSError):
                     self._raise_if_cancelled()
                     comparable_full_send = True
+                    conv_id_to_resume = None
                     with self._lock:
                         self._terminate_worker_locked(keep_conversation=False)
                         self._purge_isolated_conversations()
@@ -1138,35 +1147,58 @@ class AntigravityClient:
                     proc.stdin.write(json.dumps(event_msg) + "\n")
                     proc.stdin.flush()
 
-                with self._lock:
-                    worker_usage_baseline = self._worker_usage_baseline
-                stream_iter = AntigravityStream(
-                    proc=proc,
-                    client=self,
-                    model=resolved_model,
-                    timeout=effective_timeout,
-                    tools=tools,
-                    is_worker=True,
-                    worker_lock=self._worker_lock,
-                    worker_lock_held=worker_acquired,
-                    messages=messages_list,
-                    usage_baseline=worker_usage_baseline,
-                    prompt_chars=len(prompt_payload),
-                    delivery_watch=self._delivery_watch if comparable_full_send else None,
-                    delivery_sample_key=f"{resolved_model}:{effort}",
-                )
+                def _open_worker_stream(
+                    worker_proc: subprocess.Popen, *, lock_held: bool
+                ) -> AntigravityStream:
+                    with self._lock:
+                        baseline = self._worker_usage_baseline
+                    return AntigravityStream(
+                        proc=worker_proc,
+                        client=self,
+                        model=resolved_model,
+                        timeout=effective_timeout,
+                        tools=tools,
+                        is_worker=True,
+                        worker_lock=self._worker_lock,
+                        worker_lock_held=lock_held,
+                        messages=messages_list,
+                        usage_baseline=baseline,
+                        prompt_chars=len(prompt_payload),
+                        delivery_watch=self._delivery_watch if comparable_full_send else None,
+                        delivery_sample_key=f"{resolved_model}:{effort}",
+                    )
+
                 if stream:
+                    stream_iter = _open_worker_stream(proc, lock_held=True)
+                    # Hand lock ownership to the caller's stream only after
+                    # construction succeeds so our finally leaves it held.
+                    owns_worker_lock = False
                     return stream_iter
+
+                # Non-streaming turns keep _worker_lock owned by this frame
+                # across every attempt (including auth_retried) instead of
+                # passing lock ownership into AntigravityStream or probing
+                # _worker_lock.locked() on exit.
+                stream_iter = _open_worker_stream(proc, lock_held=False)
                 completion: Any = None
                 auth_retried = False
+                last_retry_error: RuntimeError | None = None
                 while True:
                     self._raise_if_cancelled()
-                    completion = collect_stream_completion(stream_iter)
-                    self._raise_if_cancelled()
-                    if auth_retried or not _empty_no_result(completion):
-                        break
-                    if not _stderr_shows_auth_contention(proc):
-                        break
+                    try:
+                        completion = collect_stream_completion(stream_iter)
+                    except RuntimeError as exc:
+                        self._raise_if_cancelled()
+                        if auth_retried or not _stderr_shows_auth_contention(proc):
+                            raise
+                        last_retry_error = exc
+                    else:
+                        self._raise_if_cancelled()
+                        if auth_retried or not _empty_no_result(completion):
+                            break
+                        if not _stderr_shows_auth_contention(proc):
+                            break
+                        last_retry_error = None
                     # Token contention with another agy session on this
                     # account: the worker produced no result and its stderr
                     # carries the token-source failure. Re-sync the token and
@@ -1179,9 +1211,23 @@ class AntigravityClient:
                     auth_retried = True
                     sync_isolated_token(self._isolated_home)
                     with self._lock:
+                        # stream_iter.close() on a failed attempt terminates
+                        # the worker with keep_conversation=False, clearing
+                        # _worker_conversation_id; restore it before respawn.
+                        stream_conv_id = getattr(stream_iter, "conversation_id", None)
+                        if not isinstance(stream_conv_id, str):
+                            stream_conv_id = ""
+                        retry_conv_id = (
+                            self._worker_conversation_id
+                            or conv_id_to_resume
+                            or stream_conv_id
+                            or None
+                        )
+                        if retry_conv_id and not self._worker_conversation_id:
+                            self._worker_conversation_id = retry_conv_id
                         self._terminate_worker_locked(keep_conversation=True)
                     proc = self._get_or_spawn_worker(
-                        resolved_model, effort, conversation_id=self._worker_conversation_id
+                        resolved_model, effort, conversation_id=retry_conv_id
                     )
                     event_msg = {"event": "user", "message": {"content": prompt_payload}}
                     try:
@@ -1190,43 +1236,16 @@ class AntigravityClient:
                             proc.stdin.write(json.dumps(event_msg) + "\n")
                             proc.stdin.flush()
                     except (BrokenPipeError, OSError):
+                        self._raise_if_cancelled()
+                        if last_retry_error is not None:
+                            raise last_retry_error
                         break
-                    with self._lock:
-                        worker_usage_baseline = self._worker_usage_baseline
-                    stream_iter = AntigravityStream(
-                        proc=proc,
-                        client=self,
-                        model=resolved_model,
-                        timeout=effective_timeout,
-                        tools=tools,
-                        is_worker=True,
-                        worker_lock=self._worker_lock,
-                        worker_lock_held=True,
-                        messages=messages_list,
-                        usage_baseline=worker_usage_baseline,
-                        prompt_chars=len(prompt_payload),
-                        delivery_watch=self._delivery_watch if comparable_full_send else None,
-                        delivery_sample_key=f"{resolved_model}:{effort}",
-                    )
-                try:
-                    self._raise_if_cancelled()
-                    return completion
-                finally:
-                    if self._worker_lock.locked():
-                        self._worker_lock.release()
+                    stream_iter = _open_worker_stream(proc, lock_held=False)
+                self._raise_if_cancelled()
+                return completion
             except Exception:
                 self._terminate_worker()
-                if self._worker_lock.locked():
-                    self._worker_lock.release()
                 raise
-        else:
-            self._ensure_worker_media_permissions(turn_media_paths, worker_turn=False)
-            return self._run_oneshot_completion(
-                model=resolved_model,
-                effort=effort,
-                messages=messages_list,
-                timeout=effective_timeout,
-                tools=tools,
-                tool_choice=tool_choice,
-                stream=stream,
-            )
+        finally:
+            if owns_worker_lock:
+                self._worker_lock.release()
