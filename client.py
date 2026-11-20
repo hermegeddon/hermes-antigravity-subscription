@@ -56,6 +56,7 @@ try:
     from .prompt import (
         _PROMPT_PREAMBLE,
         _ROLE_LABELS,
+        _SessionMediaSink,
         _format_delta_prompt,
         _latest_user_text,
         _format_messages_as_prompt,
@@ -64,6 +65,7 @@ try:
         _parse_tool_block,
         _render_message_content,
         _is_plugin_owned_media_path,
+        cleanup_session_media,
         media_reference_paths,
     )
     from .delivery import DeliveryWatch
@@ -96,6 +98,7 @@ except ImportError:
     from prompt import (
         _PROMPT_PREAMBLE,
         _ROLE_LABELS,
+        _SessionMediaSink,
         _format_delta_prompt,
         _latest_user_text,
         _format_messages_as_prompt,
@@ -104,6 +107,7 @@ except ImportError:
         _parse_tool_block,
         _render_message_content,
         _is_plugin_owned_media_path,
+        cleanup_session_media,
         media_reference_paths,
     )
     from delivery import DeliveryWatch
@@ -463,7 +467,7 @@ class AntigravityClient:
         self._worker_media_rules: frozenset[str] = frozenset()
         # Media files this session materialized (downloads, cache files);
         # deleted at close() so no fetched media outlives the session.
-        self._materialized_media: set[str] = set()
+        self._materialized_media: set[str] = _SessionMediaSink()
         # Cumulative usage snapshot of the current worker session. agy 1.2.10+
         # persistent workers report cumulative session usage, so per-turn
         # deltas need this baseline. The reference is replaced on every spawn
@@ -562,21 +566,13 @@ class AntigravityClient:
         # before the workspace removal; must never raise (issue #4 contract).
         with self._lock:
             materialized = set(self._materialized_media)
+            session_cache_dir = (
+                self._materialized_media.cache_dir
+                if isinstance(self._materialized_media, _SessionMediaSink)
+                else None
+            )
             self._materialized_media.clear()
-        for path in materialized:
-            try:
-                # Defense in depth: even if a foreign path ever reached the
-                # sink, close() deletes only files inside this plugin's own
-                # media cache dir — never a user-referenced file (review
-                # 5887913331, point 1).
-                if not _is_plugin_owned_media_path(path):
-                    logger.debug(
-                        "Skipping non-plugin-owned media path on close: %s", path
-                    )
-                    continue
-                os.remove(path)
-            except OSError:
-                pass
+        cleanup_session_media(materialized, cache_dir=session_cache_dir)
         # Phase 2 -- remove the private workspace, retrying transient
         # failures. close() must never raise from cleanup and must never
         # leave the client half-closed (issue #4).
