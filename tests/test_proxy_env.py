@@ -5,6 +5,7 @@ ANTIGRAVITY_PROXY is unset, and route agy's outbound HTTP(S) through the proxy
 (while keeping loopback traffic direct and HOME isolation intact) when set.
 """
 
+import ntpath
 import os
 import sys
 import tempfile
@@ -33,6 +34,16 @@ def _base_env(**extra):
     return env
 
 
+def _expected_home_env(tmp: str) -> dict[str, str]:
+    expected = {"HOME": tmp, "USERPROFILE": tmp}
+    if os.name == "nt":
+        drive, tail = ntpath.splitdrive(tmp)
+        if len(drive) == 2 and drive[1] == ":":
+            expected["HOMEDRIVE"] = drive
+            expected["HOMEPATH"] = tail or "\\"
+    return expected
+
+
 class ProxyEnvTests(unittest.TestCase):
     def _build(self, parent_env, home):
         with patch.dict(os.environ, parent_env, clear=True):
@@ -42,7 +53,7 @@ class ProxyEnvTests(unittest.TestCase):
         parent = _base_env(HTTPS_PROXY="http://inherited:3128", FOO="bar")
         with tempfile.TemporaryDirectory() as tmp:
             env = self._build(parent, tmp)
-        expected = dict(parent, HOME=tmp, USERPROFILE=tmp, AGY_CLI_DISABLE_AUTO_UPDATE="true")
+        expected = {**parent, **_expected_home_env(tmp), "AGY_CLI_DISABLE_AUTO_UPDATE": "true"}
         self.assertEqual(env, expected)
         self.assertEqual(env["HTTPS_PROXY"], "http://inherited:3128")
         self.assertNotIn("NO_PROXY", env)
@@ -52,7 +63,8 @@ class ProxyEnvTests(unittest.TestCase):
         parent = _base_env(ANTIGRAVITY_PROXY="   ")
         with tempfile.TemporaryDirectory() as tmp:
             env = self._build(parent, tmp)
-        self.assertEqual(env, dict(parent, HOME=tmp, USERPROFILE=tmp, AGY_CLI_DISABLE_AUTO_UPDATE="true"))
+        expected = {**parent, **_expected_home_env(tmp), "AGY_CLI_DISABLE_AUTO_UPDATE": "true"}
+        self.assertEqual(env, expected)
 
     def test_set_populates_all_proxy_variables(self):
         parent = _base_env(ANTIGRAVITY_PROXY=PROXY)
@@ -138,7 +150,12 @@ class ProxyEnvTests(unittest.TestCase):
         parent = _base_env(ANTIGRAVITY_PROXY=PROXY, HOMEPATH="\\Users\\real")
         with tempfile.TemporaryDirectory() as tmp:
             env = self._build(parent, tmp)
-        self.assertEqual(env["HOMEPATH"], tmp)
+        if os.name == "nt":
+            drive, tail = ntpath.splitdrive(tmp)
+            self.assertEqual(env["HOMEDRIVE"], drive)
+            self.assertEqual(env["HOMEPATH"], tail or "\\")
+        else:
+            self.assertEqual(env["HOMEPATH"], tmp)
 
 
 if __name__ == "__main__":

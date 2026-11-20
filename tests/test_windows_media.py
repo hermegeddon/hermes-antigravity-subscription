@@ -296,10 +296,11 @@ class TestWindowsNativeMediaStepPermissions:
         # Even if a POSIX test runs with cwd inside /tmp, C:/tmp/secret.txt must not
         # be mistaken for /tmp/secret.txt or resolved relative to /tmp.
         st = _make_stream(media_paths=set())
-        assert (
-            st._is_permitted_native_media_step("read_file", "read_file(C:/tmp/secret.txt)")
-            is False
-        )
+        for tool_info in (
+            "read_file(C:/tmp/secret.txt)",
+            "read_file(C:/foo bar/tmp/secret.txt)",
+        ):
+            assert st._is_permitted_native_media_step("read_file", tool_info) is False
 
     def test_end_to_end_file_uri_preserves_casing_and_allows_stream_step(self):
         uri = "file:///C:/Users/Jane%20Doe/My%20Pics/Cat%201.PNG"

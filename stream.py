@@ -91,7 +91,7 @@ def _native_media_roots() -> tuple[str, ...]:
 
 
 _WIN_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
-_TOOL_INFO_PATH_RE = re.compile(r"(?<![A-Za-z0-9_/\\.-])(/[A-Za-z0-9_\-./]+)")
+_TOOL_INFO_PATH_RE = re.compile(r"(?<![A-Za-z0-9_/\\.:-])(/[A-Za-z0-9_\-./]+)")
 _TOOL_CALL_WRAPPER_RE = re.compile(r"^\s*(?:read_file|view_file)\((.+)\)\s*$")
 _DOUBLE_QUOTED_RE = re.compile(r'"([^"\r\n]+)"')
 _SINGLE_QUOTED_RE = re.compile(r"(?:^|[\s(=:,])'([^'\r\n]+)'(?=$|[\s),;:])")
@@ -156,12 +156,15 @@ def _extract_tool_info_paths(tool_info: str) -> tuple[list[str], str]:
         if inner and _looks_like_abs_path(inner):
             candidates.append(inner)
 
-    for match in _UNQUOTED_WIN_PATH_RE.findall(unquoted):
-        cleaned = match.strip().rstrip(".,;:")
+    def _take_win(match: re.Match[str]) -> str:
+        cleaned = match.group(0).strip().rstrip(".,;:")
         if cleaned:
             candidates.append(cleaned)
+        return " "
 
-    for match in _TOOL_INFO_PATH_RE.findall(unquoted):
+    remaining = _UNQUOTED_WIN_PATH_RE.sub(_take_win, unquoted)
+
+    for match in _TOOL_INFO_PATH_RE.findall(remaining):
         cleaned = match.rstrip(".")
         if cleaned:
             candidates.append(cleaned)
