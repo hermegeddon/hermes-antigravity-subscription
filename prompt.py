@@ -1046,17 +1046,27 @@ _EMPTY_TOOL_RESPONSE_NUDGE = (
 
 
 def _is_recovery_nudge(message: dict[str, Any]) -> bool:
-    return bool(message.get("_empty_recovery_synthetic")) or (
-        _render_message_content(message.get("content")) == _EMPTY_TOOL_RESPONSE_NUDGE
-    )
+    if message.get("_empty_recovery_synthetic"):
+        return True
+    content = message.get("content")
+    if isinstance(content, str):
+        return _clean_rendered_text(content) == _EMPTY_TOOL_RESPONSE_NUDGE
+    # Avoid materializing data/HTTP media parts while probing multipart messages.
+    if isinstance(content, list) and any(
+        isinstance(item, dict)
+        and item.get("type") in ("image_url", "image", "video_url", "video", "input_audio")
+        for item in content
+    ):
+        return False
+    return _render_message_content(content) == _EMPTY_TOOL_RESPONSE_NUDGE
 
 
-def _latest_user_text(messages: Sequence[Any]) -> str:
+def _latest_user_text(messages: Sequence[Any], media_sink: Optional[set] = None) -> str:
     """Return the rendered text of the last user message, or an empty string."""
     for msg in reversed(list(messages or [])):
         if isinstance(msg, dict) and str(msg.get("role") or "").strip().lower() == "user":
             if not _is_recovery_nudge(msg):
-                return _render_message_content(msg.get("content"))
+                return _render_message_content(msg.get("content"), media_sink)
     return ""
 
 
@@ -1154,7 +1164,7 @@ def _format_messages_as_prompt(
 
     for i, message in enumerate(prior_messages):
         role = str(message.get("role") or "unknown").strip().lower()
-        rendered_content = _render_message_content(message.get("content"))
+        rendered_content = _render_message_content(message.get("content"), media_sink)
 
         if role == "tool":
             tool_id = str(message.get("tool_call_id") or message.get("name") or "tool").strip()
@@ -1201,7 +1211,7 @@ def _format_messages_as_prompt(
             transcript.append(f"{label}:\n{rendered_content}")
 
     if recovery_turn:
-        objective = _latest_user_text(history_messages)
+        objective = _latest_user_text(history_messages, media_sink)
         if objective:
             sections.append(_tool_loop_objective_section(objective))
     elif last_role == "user" and last_msg is not None and len(history_messages) > 1:
@@ -1214,7 +1224,7 @@ def _format_messages_as_prompt(
             "Focus your attention on answering the new request."
         )
     elif last_role == "tool":
-        pending_objective = _latest_user_text(history_messages)
+        pending_objective = _latest_user_text(history_messages, media_sink)
         if pending_objective:
             sections.append(_tool_loop_objective_section(pending_objective))
 
@@ -1228,11 +1238,11 @@ def _format_messages_as_prompt(
             "If more tools are needed, emit <tool_call> tags. If you have enough information, "
             "respond clearly to the user without repeating prior summaries."
         )
-        pending = _latest_user_text(history_messages)
+        pending = _latest_user_text(history_messages, media_sink)
         if pending:
             sections.append(_pending_user_request_section(pending))
     elif last_role == "user" and last_msg is not None:
-        user_text = _latest_user_text(history_messages)
+        user_text = _latest_user_text(history_messages, media_sink)
         if user_text:
             sections.append(_latest_user_request_section(user_text))
     else:
@@ -1331,7 +1341,11 @@ def _format_delta_prompt(
         if pending_user_text:
             parts.append(_pending_user_request_section(pending_user_text))
     elif last_role == "user":
-        user_text = (pending_user_text or _latest_user_text(valid_messages)) if recovery_turn else _render_message_content(last_msg.get("content"), media_sink)
+        user_text = (
+            (pending_user_text or _latest_user_text(valid_messages, media_sink))
+            if recovery_turn
+            else _render_message_content(last_msg.get("content"), media_sink)
+        )
         if user_text:
             parts.append(_latest_user_request_section(user_text))
     else:

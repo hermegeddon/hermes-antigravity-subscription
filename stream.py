@@ -370,6 +370,7 @@ class AntigravityStream(Iterator[Any]):
         prompt_chars: int = 0,
         delivery_watch: Any = None,
         delivery_sample_key: str = "",
+        media_paths: set[str] | None = None,
     ):
         # Loud pairing, not a defaulted bool (review nit): a future site
         # passing worker_lock WITHOUT worker_lock_held would silently never
@@ -396,7 +397,11 @@ class AntigravityStream(Iterator[Any]):
         self.messages = messages
         # Media paths referenced by this turn's messages: the allowlist for
         # agy's native media-attach reads (see _is_permitted_native_media_step).
-        self._media_paths = self._collect_media_reference_paths()
+        self._media_paths = (
+            set(media_paths)
+            if media_paths is not None
+            else self._collect_media_reference_paths()
+        )
         # Ownership record for the worker request lock. threading.Lock is
         # NOT owner-bound: locked() is true and release() succeeds from any
         # thread, so a lock()/locked() probe cannot tell "my lock" from
@@ -650,7 +655,8 @@ class AntigravityStream(Iterator[Any]):
         agy attaches pixels through a native read on that exact path, so the
         references ARE the allowlist for the media-attach tool steps.
         """
-        return media_reference_paths(self.messages)
+        media_sink = getattr(self.client, "_materialized_media", None)
+        return media_reference_paths(self.messages, media_sink)
 
     def _is_permitted_native_media_step(self, tool_name: str, tool_info: str) -> bool:
         """True when a native tool step is exactly the media-attach read.

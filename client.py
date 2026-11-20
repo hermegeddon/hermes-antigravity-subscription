@@ -943,6 +943,7 @@ class AntigravityClient:
         tools: list[dict[str, Any]] | None,
         tool_choice: Any,
         stream: bool,
+        media_paths: set[str] | None = None,
     ) -> Any:
         prompt_text = _format_messages_as_prompt(
             messages,
@@ -1006,6 +1007,7 @@ class AntigravityClient:
             # The turn's messages feed the native media-attach allowlist
             # (read_file/view_file on referenced media paths only).
             messages=messages,
+            media_paths=media_paths,
             # Oneshots run concurrently when the worker is busy. They have no
             # comparable prior sample and must not mutate the worker watch.
             delivery_watch=None,
@@ -1068,6 +1070,7 @@ class AntigravityClient:
                 tools=tools,
                 tool_choice=tool_choice,
                 stream=stream,
+                media_paths=turn_media_paths,
             )
 
         owns_worker_lock = True
@@ -1093,7 +1096,9 @@ class AntigravityClient:
                     delta_msgs = messages_list[len(ref_history):]
                     prompt_payload = _format_delta_prompt(
                         delta_msgs,
-                        pending_user_text=_latest_user_text(messages_list),
+                        pending_user_text=_latest_user_text(
+                            messages_list, media_sink=self._materialized_media
+                        ),
                         media_sink=self._materialized_media,
                     )
                     dump_prompt_debug(
@@ -1168,6 +1173,7 @@ class AntigravityClient:
                         worker_lock=self._worker_lock,
                         worker_lock_held=lock_held,
                         messages=messages_list,
+                        media_paths=turn_media_paths,
                         usage_baseline=baseline,
                         prompt_chars=len(prompt_payload),
                         delivery_watch=self._delivery_watch if comparable_full_send else None,

@@ -570,6 +570,89 @@ class SessionIsolationAndConcurrencyTests(unittest.TestCase):
 
         self.assertEqual(os.listdir(self.tmp.name), [])
 
+    def test_prompt_assembly_and_delta_keep_session_media_sink_isolated(self):
+        import io
+        from unittest.mock import MagicMock
+        import client as agy_client
+        import stream as agy_stream
+
+        raw = b"\x89PNG\r\n\x1a\nprompt-sink-test"
+        data_uri = f"data:image/png;base64,{base64.b64encode(raw).decode()}"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this image"},
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                ],
+            }
+        ]
+        cl = agy_client.AntigravityClient()
+        try:
+            ref_paths = agy_prompt.media_reference_paths(messages, cl._materialized_media)
+            rendered_full = agy_prompt._format_messages_as_prompt(
+                messages, model="gemini-3.8-flash", media_sink=cl._materialized_media
+            )
+            prior_plus_tool = messages + [
+                {"role": "assistant", "content": "<tool_call>{\"name\":\"ping\",\"arguments\":{}}</tool_call>"},
+                {"role": "tool", "tool_call_id": "t1", "content": "ok"},
+            ]
+            rendered_with_history = agy_prompt._format_messages_as_prompt(
+                prior_plus_tool, model="gemini-3.8-flash", media_sink=cl._materialized_media
+            )
+            pending = agy_prompt._latest_user_text(
+                prior_plus_tool, media_sink=cl._materialized_media
+            )
+            rendered_delta = agy_prompt._format_delta_prompt(
+                prior_plus_tool[1:],
+                pending_user_text=pending,
+                media_sink=cl._materialized_media,
+            )
+
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.stdout = io.StringIO("")
+            st_fallback = agy_stream.AntigravityStream(
+                proc=proc,
+                client=cl,
+                model="gemini-3.8-flash",
+                timeout=5.0,
+                messages=messages,
+            )
+            st_explicit = agy_stream.AntigravityStream(
+                proc=proc,
+                client=cl,
+                model="gemini-3.8-flash",
+                timeout=5.0,
+                messages=messages,
+                media_paths=ref_paths,
+            )
+
+            self.assertEqual(len(ref_paths), 1)
+            self.assertEqual(st_fallback._media_paths, ref_paths)
+            self.assertEqual(st_explicit._media_paths, ref_paths)
+            session_path = next(iter(ref_paths))
+            self.assertIn(cl._materialized_media.cache_dir, session_path)
+            # No un-isolated file may be created directly under _media_cache_dir().
+            root_files = [
+                name
+                for name in os.listdir(self.tmp.name)
+                if not name.startswith("session_")
+            ]
+            self.assertEqual(root_files, [])
+
+            for rendered in (rendered_full, rendered_with_history, rendered_delta):
+                extracted = {
+                    os.path.normpath(p)
+                    for p in agy_prompt._MEDIA_REF_RE.findall(rendered)
+                    if p != "/abs/path"
+                }
+                self.assertEqual(extracted, ref_paths)
+        finally:
+            cl.close()
+
+        self.assertEqual(os.listdir(self.tmp.name), [])
+
 
 if __name__ == "__main__":
     unittest.main()
