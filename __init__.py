@@ -364,6 +364,8 @@ if "models_dev_id" in _PROFILE_FIELD_NAMES:
     _PROFILE_EXTRA_FIELDS["models_dev_id"] = "google"
 if "model_capabilities" in _PROFILE_FIELD_NAMES:
     _PROFILE_EXTRA_FIELDS["model_capabilities"] = _LazyModelCapabilities()
+if "unsupported_response_formats" in _PROFILE_FIELD_NAMES:
+    _PROFILE_EXTRA_FIELDS["unsupported_response_formats"] = ("json_schema",)
 
 antigravity_profile = AntigravitySubscriptionDirectSDKProfile(
     name="antigravity-subscription-directsdk",
@@ -380,7 +382,6 @@ antigravity_profile = AntigravitySubscriptionDirectSDKProfile(
     default_aux_model="gemini-3.8-flash",
     fallback_models=(),  # Account-scoped models: discovered dynamically via fetch_models() (agy models)
     supports_vision=True,
-    unsupported_response_formats=("json_schema",),
     classify_api_error=_classify_antigravity_error,
     **_PROFILE_EXTRA_FIELDS,
 )
