@@ -29,6 +29,13 @@ _KNOWN_EFFORTS: dict[str, tuple[str, ...]] = {
     "claude-sonnet-4-6": (),
     "claude-opus-4-6-thinking": (),
     "gpt-oss-120b": ("medium",),
+    "gemini-4-neon": ("low", "medium", "high"),
+    "gemini-4-carbon": ("low", "medium", "high"),
+    "gemini-4-argon": ("low", "medium", "high"),
+    "gemini-4-hydrogen": ("low", "medium", "high"),
+    "gemini-pro-orchestrator": (),
+    "gemini-pro-orchestrator-neon": (),
+    "gemini-pro-orchestrator-argon": (),
 }
 
 _FALLBACK_MODELS = list(_KNOWN_EFFORTS)
@@ -41,6 +48,13 @@ _MODEL_ALIASES = {
     "pro": "gemini-3.1-pro",
     "gemini-pro": "gemini-3.1-pro",
     "gemini-3.1": "gemini-3.1-pro",
+    "orchestrator": "gemini-pro-orchestrator",
+    "gemini-orchestrator": "gemini-pro-orchestrator",
+    "gemini-4": "gemini-4-neon",
+    "neon": "gemini-4-neon",
+    "hydrogen": "gemini-4-hydrogen",
+    "argon": "gemini-4-argon",
+    "carbon": "gemini-4-carbon",
     "sonnet": "claude-sonnet-4-6",
     "claude-sonnet": "claude-sonnet-4-6",
     "claude-sonnet-5-5": "claude-sonnet-4-6",
@@ -49,12 +63,13 @@ _MODEL_ALIASES = {
     "claude-opus-5-5": "claude-opus-4-6-thinking",
 }
 
-# Effort suffixes agy appends to a base model id. `-xhigh` is not an effort
-# agy accepts: it is an incorrect listing duplicate of `-high` (issue #47),
-# so it normalizes into the base model's `high` variant just like
-# `_normalize_effort` maps a requested "xhigh" effort to "high".
+# Effort suffixes agy appends to a base model id, or that callers use as
+# effort aliases. `-xhigh` (issue #47 duplicate listing on several models)
+# and `-max` normalize into the base model's `high` variant, matching
+# `_normalize_effort`.
 _EFFORT_SUFFIXES = (
     ("-xhigh", "high"),
+    ("-max", "high"),
     ("-high", "high"),
     ("-medium", "medium"),
     ("-low", "low"),
@@ -233,9 +248,15 @@ def model_efforts(base_model: str, *, refresh: bool = True) -> tuple[str, ...] |
 
 def _heuristic_efforts(base_model: str, has_suffix: bool) -> tuple[str, ...]:
     """Efforts for a model that neither agy nor the built-in table lists."""
-    if base_model.startswith("gemini-") and "pro" in base_model:
+    name = base_model.lower()
+    # Orchestrators are bare-name models despite containing "pro"; check first.
+    if "orchestrator" in name:
+        return ("low", "medium", "high") if has_suffix else ()
+    if name.startswith("gemini-4-"):
+        return ("low", "medium", "high")
+    if name.startswith("gemini-") and "pro" in name:
         return ("low", "high")
-    if base_model.startswith("gemini-") and "flash" in base_model:
+    if name.startswith("gemini-") and "flash" in name:
         return ("low", "medium", "high")
     # A suffixed id is an effort variant; a bare unknown id takes no --effort.
     return ("low", "medium", "high") if has_suffix else ()
@@ -250,6 +271,60 @@ def _nearest_effort(requested: str, supported: tuple[str, ...]) -> str:
     )
 
 
+def _apply_suffix_if_supported(
+    target: str,
+    suffix: str | None,
+    catalog: dict[str, tuple[str, ...]],
+) -> str:
+    """Append `-<suffix>` only when `catalog` defines effort levels for `target`."""
+    if suffix and catalog.get(target):
+        return f"{target}-{suffix}"
+    return target
+
+
+def _resolve_catalog_family(
+    lookup_term: str,
+    catalog: dict[str, tuple[str, ...]],
+) -> str | None:
+    """Match a family alias against `catalog`, returning the base model id or None."""
+    if lookup_term in ("pro", "gemini-pro", "gemini-3.1"):
+        non_orch_pro = [
+            k for k in catalog
+            if "pro" in k.lower() and "orchestrator" not in k.lower()
+        ]
+        if non_orch_pro:
+            return sorted(non_orch_pro, reverse=True)[0]
+        # agy 1.5+ replaced gemini-3.1-pro with gemini-4-* while adding bare
+        # gemini-pro-orchestrator*; preserve `agy models` order for gemini-4-*.
+        gemini4_matches = [k for k in catalog if k.lower().startswith("gemini-4-")]
+        if gemini4_matches:
+            return gemini4_matches[0]
+        pro_matches = [k for k in catalog if "pro" in k.lower()]
+        if pro_matches:
+            return sorted(pro_matches, reverse=True)[0]
+        return None
+
+    if lookup_term in ("orchestrator", "gemini-orchestrator"):
+        if "gemini-pro-orchestrator" in catalog:
+            return "gemini-pro-orchestrator"
+        orch_matches = [k for k in catalog if "orchestrator" in k.lower()]
+        return orch_matches[0] if orch_matches else None
+
+    family_keywords = {
+        ("sonnet", "claude-sonnet"): "sonnet",
+        ("opus", "claude-opus"): "opus",
+        ("flash", "gemini-flash", "gemini-3.8"): "flash",
+        ("gpt", "gpt-oss", "oss"): "gpt",
+    }
+    for triggers, kw in family_keywords.items():
+        if lookup_term in triggers:
+            matches = [k for k in catalog if kw in k.lower()]
+            if matches:
+                # Sort descending so newer versions win (5-5 before 4-6, 3.8 before 3.7).
+                return sorted(matches, reverse=True)[0]
+    return None
+
+
 def resolve_model_alias(
     model: str, catalog: dict[str, tuple[str, ...]] | None = None
 ) -> str:
@@ -258,45 +333,33 @@ def resolve_model_alias(
     lower_m = m.lower()
 
     if catalog:
-        # Exact match or base match already exists in catalog
         if lower_m in catalog:
             return lower_m
         base, suffix = split_effort_suffix(lower_m)
         if base in catalog:
-            return lower_m
+            return _apply_suffix_if_supported(base, suffix, catalog)
 
         lookup_term = "flash" if base == "default" else base
+        family_match = _resolve_catalog_family(lookup_term, catalog)
+        if family_match is not None:
+            return _apply_suffix_if_supported(family_match, suffix, catalog)
 
-        # Dynamic family matching against whatever models agy actually returned
-        family_keywords = {
-            ("sonnet", "claude-sonnet"): "sonnet",
-            ("opus", "claude-opus"): "opus",
-            ("pro", "gemini-pro", "gemini-3.1"): "pro",
-            ("flash", "gemini-flash", "gemini-3.8"): "flash",
-            ("gpt", "gpt-oss", "oss"): "gpt",
-        }
-        for triggers, kw in family_keywords.items():
-            if lookup_term in triggers:
-                matches = [k for k in catalog if kw in k.lower()]
-                if matches:
-                    # Sort descending so newer versions win if multiple exist (5-5 before 4-6, 3.8 before 3.7)
-                    best = sorted(matches, reverse=True)[0]
-                    return f"{best}-{suffix}" if suffix else best
-
-        # General substring match against catalog
-        matches = [k for k in catalog if lookup_term in k.lower()]
-        if matches:
-            best = sorted(matches, reverse=True)[0]
-            return f"{best}-{suffix}" if suffix else best
-
-        # Check explicit fallback aliases if not matched dynamically in catalog
+        # Check explicit aliases before substring matching so codenames like
+        # `neon` and `argon` map to `gemini-4-*` instead of `gemini-pro-orchestrator-*`.
         if lookup_term in _MODEL_ALIASES:
             aliased = _MODEL_ALIASES[lookup_term]
             if aliased in catalog:
-                return f"{aliased}-{suffix}" if suffix else aliased
+                return _apply_suffix_if_supported(aliased, suffix, catalog)
+
+        matches = [k for k in catalog if lookup_term in k.lower()]
+        if matches:
+            best = sorted(matches, reverse=True)[0]
+            return _apply_suffix_if_supported(best, suffix, catalog)
 
     base, suffix = split_effort_suffix(lower_m)
     fallback = _MODEL_ALIASES.get(base, base)
+    if fallback in _KNOWN_EFFORTS:
+        return _apply_suffix_if_supported(fallback, suffix, _KNOWN_EFFORTS)
     if suffix and fallback != base:
         return f"{fallback}-{suffix}"
     return _MODEL_ALIASES.get(lower_m, m)
